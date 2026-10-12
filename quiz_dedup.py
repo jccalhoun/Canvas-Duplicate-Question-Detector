@@ -2304,6 +2304,14 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
 
     spread = bank_spread(variants, [b.bank for b in audit], ctx.get("cluster_of", {}))
 
+    def questions_cell(c):
+        """Questions in the export, and the distinct ones compared when that differs:
+        a bank can repeat a question, and --exclude-type drops some."""
+        held = spread.get((c.source_file, c.cid), (0, 0, 0))[0]
+        if held == c.item_count:
+            return str(c.item_count)
+        return f"{c.item_count} <span class='src'>({held} distinct compared)</span>"
+
     def spread_cell(c):
         held, same, modified = spread.get((c.source_file, c.cid), (0, 0, 0))
         if not held:
@@ -2325,7 +2333,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                        f"<td title='export id {esc(c.cid)}'>[{esc(kind_label('bank', c.engine))}] "
                        f"<strong>{esc(c.title)}</strong>{tag_span(b)}"
                        f"{source(c)}{hint}</td>"
-                       f"<td>{c.item_count}</td><td>{spread_cell(c)}</td><td>{esc(b.status)}</td>"
+                       f"<td>{questions_cell(c)}</td><td>{spread_cell(c)}</td><td>{esc(b.status)}</td>"
                        f"<td>{used_by_cell(b.usage, c.source_file)}</td><td>{verdict}</td></tr>")
         if not b.verdict:
             continue
@@ -2540,16 +2548,6 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
         if cov.in_unlinked:
             per_bank = Counter(k for keys in cov.in_unlinked.values() for k in keys)
             sole = Counter(keys[0] for keys in cov.in_unlinked.values() if len(keys) == 1)
-            def only_here(k):
-                if not sole[k]:
-                    return ""
-                return ", all in no other bank" if sole[k] == per_bank[k] else f", {sole[k]} in no other bank"
-            banks_text = "; ".join(
-                f"{bank_desc(k)}: {per_bank[k]}{only_here(k)}"
-                for k in sorted(per_bank, key=lambda k: (-per_bank[k], bank_titles.get(k, "").lower())))
-            count = len(cov.in_unlinked)
-            head = (f"{plural(count, 'question')} {'is' if count == 1 else 'are'} only in banks no quiz links to:"
-                    f"</strong> {banks_text}.")
             # the quiz's copy is what keeps such a question "in use" when no other quiz holds it,
             # so a bank called safe to delete on the strength of it is the risky case
             here = (c.source_file, c.cid)
@@ -2559,6 +2557,24 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
             safe = {k for i in sole_copy for k in cov.in_unlinked[i]
                     if bank_info.get(k) and bank_info[k].verdict in (VERDICT_SAFE, VERDICT_COVERED)}
             at_risk = sum(1 for i in sole_copy if safe & set(cov.in_unlinked[i]))
+
+            def only_here(k):
+                if not sole[k]:
+                    return ""
+                return ", all in no other bank" if sole[k] == per_bank[k] else f", {sole[k]} in no other bank"
+            # name the banks that matter (sole holders, banks called safe), fold the rest into a count;
+            # every bank is still named in the question list below
+            order = sorted(per_bank, key=lambda k: (-per_bank[k], bank_titles.get(k, "").lower()))
+            named = [k for k in order if sole[k] or k in safe] or order[:3]
+            if len(order) - len(named) == 1:
+                named = order
+            rest = len(order) - len(named)
+            banks_text = "; ".join(f"{bank_desc(k)}: {per_bank[k]}{only_here(k)}" for k in named)
+            if rest:
+                banks_text += f"; and {plural(rest, 'other bank')}, listed with each question below"
+            count = len(cov.in_unlinked)
+            head = (f"{plural(count, 'question')} {'is' if count == 1 else 'are'} only in banks no quiz links to:"
+                    f"</strong> {banks_text}.")
             if safe:
                 names = ", ".join(f"{esc(bank_titles.get(k, k[1]))}{tag_span(bank_info[k])}"
                                   for k in sorted(safe, key=lambda k: bank_titles.get(k, "").lower()))

@@ -1519,6 +1519,46 @@ class QuizCoverageCheck(ExportCase):
             self.assertTrue(h.startswith(" <span class='src'>#"), h[:60])
             self.assertIn("first question: ", h[:600])
 
+    def test_long_bank_lists_are_folded(self):
+        others = ["Which organ pumps blood around the body?", "What gas do plants take in from the air?",
+                  "Which planet is known as the red planet?", "What is the boiling point of water at sea level?",
+                  "Which ocean is the largest on Earth?"]
+        files = self.course()
+        for k, stem in enumerate(others):
+            files[f"non_cc_assessments/gv{k}.xml.qti"] = bank(
+                f"gv{k}", f"Spread {k}", [item(*self.Q6), item(MC, stem, ["Alpha", "Beta", "Gamma", "Delta"], ["Alpha"])])
+        files["non_cc_assessments/gq5.xml.qti"] = quiz("gq5", "Spread quiz", [item(*self.Q6)])
+        path = self.export(files)
+        out = os.path.join(self.dir, "report.html")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with open(out, encoding="utf-8") as f:
+            card = self.card(f.read(), "Spread quiz")
+        # no bank holds it alone and none is called safe, so three are named and the rest counted
+        start = card.index("only in banks no quiz links to")
+        note = card[start:card.index("</p>", start)]
+        self.assertEqual(note.count("Spread "), 3)
+        self.assertIn("and 2 other banks, listed with each question below", note)
+        # the question list still names all five
+        self.assertEqual(card[card.index("<details>"):].count("Spread "), 5)
+
+    def test_bank_table_shows_distinct_count_when_it_differs(self):
+        files = self.course()
+        files["non_cc_assessments/gw.xml.qti"] = bank("gw", "Repeats", [item(*self.Q6), item(*self.Q6)])
+        path = self.export(files)
+        out = os.path.join(self.dir, "report.html")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with open(out, encoding="utf-8") as f:
+            report = f.read()
+        row = report[report.index("<strong>Repeats</strong>"):]
+        row = row[:row.index("</tr>")]
+        self.assertIn("<td>2 <span class='src'>(1 distinct compared)</span></td>", row)
+        persuasion = report[report.index("<strong>Persuasion</strong>"):]
+        self.assertIn("<td>2</td>", persuasion[:persuasion.index("</tr>")])
+
     def test_canvas_error_type_is_explained(self):
         self.assertIn("could not export", qd.type_label("Error"))
         self.assertEqual(qd.type_label(MC), MC)
