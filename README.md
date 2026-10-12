@@ -6,7 +6,7 @@ It is meant for courses that have been copied forward for years and have collect
 
 ## What it finds
 
-- **Orphan question banks.** Which banks a quiz uses, and for each bank no quiz uses, whether every one of its questions also lives somewhere that is in use, as is or as a modified version. Banks are sorted into *Safe to delete*, *Review the diffs first*, and *Has questions not found in use*.
+- **Orphan question banks.** Which banks a quiz uses, and for each bank no quiz uses, whether every one of its questions also lives somewhere that is in use, as is or as a modified version. For questions no quiz uses, it picks one bank to keep so the other copies can go. The report opens with a written summary naming the banks in each group.
 - **Duplicate quizzes and banks.** Whole quizzes or question banks that hold exactly the same questions as another, and ones that are mostly or fully contained in another. Quizzes that pull their questions from banks are listed with what they pull.
 - **Modified questions.** Versions of the same question where the stem wording, the answer choices, or the answer key was changed. Versions are grouped into clusters, and each version is shown as a word-level diff against the most-used one.
 - **Similar wording, different answer.** Questions that read alike but where the wording and the credited answer both differ, such as a statement and its opposite. These are usually different questions, so they are listed apart from the modified questions.
@@ -88,7 +88,7 @@ The JSON file holds the same findings as the HTML report, in the same order, for
 | Key | Contents |
 | --- | --- |
 | `generated`, `settings`, `summary`, `question_images` | Run date, the options used, overall counts, and how question images were compared |
-| `bank_usage_audit`, `classic_bank_links` | Each bank's usage status and orphan verdict, and how many quiz questions point back to a bank question |
+| `bank_usage_audit`, `classic_bank_links` | Each bank's usage status, orphan verdict, the kept banks it relies on or is kept for, and how many quiz questions point back to a bank question |
 | `quizzes_and_banks` | Every quiz and bank, with what each quiz draws or uses from banks |
 | `identical_quizzes_and_banks`, `mostly_contained`, `quizzes_with_nothing_in_export` | The whole-quiz and whole-bank findings |
 | `modified_questions`, `similar_wording_different_answer` | Clusters of versions |
@@ -111,25 +111,31 @@ The first section of the report answers one question for every bank: can it be d
 
 Usage counts every quiz in the export, including quizzes left out of the comparison with `--exclude-title`: excluding a quiz from the comparison does not stop it using its banks.
 
-**Verdict.** For a bank that is not linked, each of its questions is sorted by where else it is found in the same export:
+**Verdict.** For a bank that is not linked, each of its questions is first sorted by where else it is found in the same export:
 
 | Found | Meaning |
 |---|---|
 | in use as is | the same question is in a quiz or in a linked bank |
 | in use as a modified version | a version from the same *Modified questions* group is in a quiz or a linked bank |
-| only in other unlinked banks | copies or versions exist, but only in banks no quiz uses |
+| also in other unused banks | copies or versions exist, but only in banks no quiz uses |
 | nowhere else | the question is unique to this bank |
 
 Only quizzes and linked banks count as in use. Otherwise two unused copies of one bank would each make the other look safe, and deleting both would lose the questions.
 
+**Keeping one copy.** Questions in the last two rows need one bank to stay. Every bank holding a question found nowhere else is kept. After that, the bank holding the most of the remaining questions is kept, then the next, until each of those questions is in a kept bank. Ties go to the larger bank, then the first by title. The other banks' questions are then counted as *in a bank to keep*, as is or as a modified version.
+
 | Verdict | When |
 |---|---|
-| **Safe to delete** | every question is in use as is |
-| **Review the diffs first** | some questions are in use only as a modified version, so this bank may hold the wording you want; or some were removed by `--exclude-type` and not checked |
-| **Has questions not found in use** | some questions are only in other unlinked banks or nowhere else |
+| **Has unique questions** | it holds questions found nowhere else. Whether to keep it depends on whether you want the material, not on duplication |
+| **Keep as the one copy** | its leftover questions exist only in other unused banks, and this bank was picked to hold them |
+| **Review the diffs first** | some questions survive only as modified versions, in use or in a bank to keep; or some were removed by `--exclude-type` and not checked |
+| **Safe to delete if the kept copies stay** | every question is in use or in a bank to keep, unchanged |
+| **Safe to delete** | every question is in use, unchanged, somewhere else |
 | **Empty in the export** | the bank has no questions in the export |
 
-Each review item links to its group in *Modified questions*, where the word-level diff shows what changed. When several banks share a title, the table also shows each one's first question to help tell them apart.
+The section opens with a summary of each verdict and the banks in it. Banks with unique questions are listed by how many they hold, with numbered families such as `chapter_1-...`, `chapter_2-...` folded into one line. Each *keep as the one copy* example names the banks that rely on it. When several banks share a title, each gets a number (`#12`) used everywhere in the section, and the table also shows its first question.
+
+Each review item links to its group in *Modified questions*, where the word-level diff shows what changed.
 
 The statuses can be checked against the Unused Classic Quiz Bank Checker: its *Used?* column should read `LINKED`, `COPIED ONLY` or `no` for the same banks. Match banks by title and question count, since the export does not carry Canvas's bank ids.
 

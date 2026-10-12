@@ -1133,14 +1133,29 @@ def describe_contents(c):
 # question (assessment_question_identifierref); that makes the bank "copied
 # only": no quiz needs it, but its questions went somewhere.
 USED_LINKED, USED_COPIED, UNUSED = "linked", "copied only", "unused"
-VERDICT_SAFE, VERDICT_REVIEW, VERDICT_KEEP, VERDICT_EMPTY = "safe", "review", "keep", "empty"
+VERDICT_SAFE, VERDICT_COVERED, VERDICT_REVIEW = "safe", "covered", "review"
+VERDICT_UNIQUE, VERDICT_COPY, VERDICT_EMPTY = "unique", "keep_copy", "empty"
 VERDICT_LABELS = {
     VERDICT_SAFE: "Safe to delete",
+    VERDICT_COVERED: "Safe to delete if the kept copies stay",
     VERDICT_REVIEW: "Review the diffs first",
-    VERDICT_KEEP: "Has questions not found in use",
+    VERDICT_UNIQUE: "Has unique questions",
+    VERDICT_COPY: "Keep as the one copy",
     VERDICT_EMPTY: "Empty in the export",
 }
-VERDICT_ORDER = (VERDICT_KEEP, VERDICT_REVIEW, VERDICT_SAFE, VERDICT_EMPTY)
+VERDICT_HELP = {
+    VERDICT_SAFE: "Every question in them is in use, unchanged, somewhere else.",
+    VERDICT_COVERED: ("Every question in them is in use or in a bank marked \u201ckeep as the one copy\u201d, "
+                      "unchanged. They can go as long as those banks stay."),
+    VERDICT_REVIEW: ("Some questions survive only as modified versions, in use or in a bank to keep, so one of "
+                     "these banks may hold the wording you want."),
+    VERDICT_UNIQUE: ("They hold questions found nowhere else in the export. Whether to keep them depends on "
+                     "whether you want the material, not on duplication."),
+    VERDICT_COPY: ("Their leftover questions exist only in other unused banks. One bank was picked to keep for "
+                   "each set of copies, so the others can go."),
+    VERDICT_EMPTY: "No questions in the export.",
+}
+VERDICT_ORDER = (VERDICT_UNIQUE, VERDICT_COPY, VERDICT_REVIEW, VERDICT_COVERED, VERDICT_SAFE, VERDICT_EMPTY)
 
 
 @dataclass
@@ -1191,7 +1206,11 @@ def find_bank_usage(questions, containers):
 class BankFinding:
     """One question of a bank that is not linked, and where else it lives."""
     variant: int          # index into variants
-    coverage: str         # "exact", "modified", "unused_only" or "unique"
+    # "exact" / "modified": in use as is / as a modified version
+    # "kept_copy" / "kept_version": not in use, but a bank kept as the one copy holds it as is / as a version
+    # "unused_only": only in other unlinked banks (said of a bank that is itself kept)
+    # "unique": nowhere else
+    coverage: str
     places: list = field(default_factory=list)  # titles of the other quizzes and banks involved
 
 
@@ -1203,6 +1222,8 @@ class BankVerdict:
     verdict: str = ""
     findings: list = field(default_factory=list)   # BankFinding per distinct question
     not_compared: int = 0                          # questions removed by --exclude-type
+    kept_for: list = field(default_factory=list)   # BankVerdicts that rely on this kept bank
+    relies_on: list = field(default_factory=list)  # kept BankVerdicts this one relies on
 
     def count(self, coverage):
         return sum(1 for f in self.findings if f.coverage == coverage)
@@ -1218,10 +1239,17 @@ def check_orphan_banks(variants, roots, containers, usage, excluded_items=None):
       unique       nowhere else
 
     Only quizzes and linked banks count as "in use": two unlinked copies of
-    one bank must not vouch for each other. Returns a BankVerdict for every
-    bank, linked ones included (with no verdict), sorted by title.
-    `excluded_items` maps (export, bank id) to how many of its questions an
-    --exclude-type filter removed; those could not be checked."""
+    one bank must not vouch for each other. Questions that are not in use at
+    all ("at risk") then need one bank to stay. A bank holding a question no
+    other bank has must stay; after those, banks are kept greedily, the one
+    holding the most at-risk questions not yet kept first, until every
+    at-risk question is in a kept bank. Questions of the other banks that
+    were at risk become kept_copy or kept_version.
+
+    Returns a BankVerdict for every bank, linked ones included (with no
+    verdict), sorted by title. `excluded_items` maps (export, bank id) to how
+    many of its questions an --exclude-type filter removed; those could not
+    be checked."""
     excluded_items = excluded_items or {}
     linked = {key for key, u in usage.items() if u.status == USED_LINKED}
 
@@ -1235,7 +1263,10 @@ def check_orphan_banks(variants, roots, containers, usage, excluded_items=None):
     for idx, r in enumerate(roots):
         by_root.setdefault(r, []).append(idx)
 
-    results = []
+    def titles(qs):
+        return sorted({q.quiz_title for q in qs}, key=str.lower)
+
+    results, candidates = [], []
     for c in sorted((c for c in containers if c.kind == "bank"),
                     key=lambda c: (c.title.lower(), c.source_file, c.cid)):
         u = usage.get((c.source_file, c.cid), BankUsage())
@@ -1243,6 +1274,7 @@ def check_orphan_banks(variants, roots, containers, usage, excluded_items=None):
         results.append(result)
         if u.status == USED_LINKED:
             continue
+        candidates.append(result)
         here = (c.source_file, "bank", c.cid)
         for idx in sorted(c.members):
             elsewhere = [q for q in variants[idx].occurrences
@@ -1250,7 +1282,6 @@ def check_orphan_banks(variants, roots, containers, usage, excluded_items=None):
             versions = [q for j in by_root.get(roots[idx], ()) if j != idx
                         for q in variants[j].occurrences
                         if q.source_file == c.source_file and place(q) != here]
-            titles = lambda qs: sorted({q.quiz_title for q in qs}, key=str.lower)
             if any(in_use(q) for q in elsewhere):
                 finding = BankFinding(idx, "exact", titles(q for q in elsewhere if in_use(q)))
             elif any(in_use(q) for q in versions):
@@ -1260,14 +1291,68 @@ def check_orphan_banks(variants, roots, containers, usage, excluded_items=None):
             else:
                 finding = BankFinding(idx, "unique")
             result.findings.append(finding)
-        if not result.findings and not result.not_compared:
-            result.verdict = VERDICT_EMPTY
-        elif result.count("unique") or result.count("unused_only"):
-            result.verdict = VERDICT_KEEP
-        elif result.count("modified") or result.not_compared:
-            result.verdict = VERDICT_REVIEW
+
+    # ---- keep one copy of every question that is not in use anywhere
+    at_risk = {}  # id(result) -> {(export, root)}
+    for r in candidates:
+        at_risk[id(r)] = {(r.bank.source_file, roots[f.variant]) for f in r.findings
+                          if f.coverage in ("unused_only", "unique")}
+    holders = {}
+    for r in candidates:
+        for key in at_risk[id(r)]:
+            holders.setdefault(key, []).append(r)
+    kept, covered = [], set()
+    for r in candidates:  # a bank with a question no other bank has must stay
+        if any(len(holders[key]) == 1 for key in at_risk[id(r)]):
+            kept.append(r)
+            covered |= at_risk[id(r)]
+    while True:
+        best, gain = None, 0
+        for r in candidates:
+            new = len(at_risk[id(r)] - covered)
+            # ties: the bank with more questions, then the first by title
+            if new > gain or (new == gain and new and best is not None and r.bank.size > best.bank.size):
+                best, gain = r, new
+        if best is None:
+            break
+        kept.append(best)
+        covered |= at_risk[id(best)]
+    kept_ids = {id(r) for r in kept}
+    kept_places = {(r.bank.source_file, "bank", r.bank.cid): r for r in kept}
+
+    for r in candidates:
+        if id(r) in kept_ids:
+            continue
+        here = (r.bank.source_file, "bank", r.bank.cid)
+        for f in r.findings:
+            if f.coverage not in ("unused_only", "unique"):
+                continue
+            exact = [kept_places[place(q)] for q in variants[f.variant].occurrences
+                     if place(q) in kept_places and place(q) != here]
+            version = [kept_places[place(q)] for j in by_root.get(roots[f.variant], ()) if j != f.variant
+                       for q in variants[j].occurrences if place(q) in kept_places and place(q) != here]
+            keepers = exact or version
+            f.coverage = "kept_copy" if exact else "kept_version"
+            f.places = sorted({k.bank.title for k in keepers}, key=str.lower)
+            for k in keepers:
+                if r not in k.kept_for:
+                    k.kept_for.append(r)
+                if k not in r.relies_on:
+                    r.relies_on.append(k)
+
+    for r in candidates:
+        if not r.findings and not r.not_compared:
+            r.verdict = VERDICT_EMPTY
+        elif r.count("unique"):
+            r.verdict = VERDICT_UNIQUE
+        elif id(r) in kept_ids:
+            r.verdict = VERDICT_COPY
+        elif r.count("modified") or r.count("kept_version") or r.not_compared:
+            r.verdict = VERDICT_REVIEW
+        elif r.count("kept_copy"):
+            r.verdict = VERDICT_COVERED
         else:
-            result.verdict = VERDICT_SAFE
+            r.verdict = VERDICT_SAFE
     return results
 
 
@@ -1539,13 +1624,17 @@ def build_json_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                     "copied_into": sorted(u.copied_into, key=str.lower),
                     "verdict": b.verdict or None})
         if b.verdict:
-            out["counts"] = {k: b.count(k) for k in ("exact", "modified", "unused_only", "unique")}
+            out["verdict_label"] = VERDICT_LABELS[b.verdict]
+            out["counts"] = {k: b.count(k) for k in ("exact", "modified", "kept_copy", "kept_version",
+                                                     "unused_only", "unique")}
             out["counts"]["not_compared"] = b.not_compared
+            out["kept_as_the_one_copy_for"] = [ref(o.bank) for o in b.kept_for]
+            out["relies_on_keeping"] = [ref(o.bank) for o in b.relies_on]
             out["questions_to_review"] = [
                 {"coverage": f.coverage, "stem": ctx["variants"][f.variant].rep.text, "places": f.places,
                  "modified_group": ctx.get("cluster_of", {}).get(id(ctx["variants"][f.variant]))
-                 if f.coverage == "modified" else None}
-                for f in b.findings if f.coverage != "exact"]
+                 if f.coverage in ("modified", "kept_version") else None}
+                for f in b.findings if f.coverage not in ("exact", "kept_copy")]
         return out
 
     quizzes = [c for c in containers if c.kind == "quiz"]
@@ -1799,8 +1888,28 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
 
     audit_rows = ""
     audit_groups = {v: [] for v in VERDICT_ORDER}
-    # same-named banks are the hard case, so those rows also show their first question
+    anchor_of = {id(b): n for n, b in enumerate(audit, 1)}
     title_count = Counter((b.bank.source_file, b.bank.title.lower()) for b in audit)
+
+    def same_name_tag(b):
+        """'#4' for a bank that shares its title with another, so the two can be told apart."""
+        return f"#{anchor_of[id(b)]}" if title_count[(b.bank.source_file, b.bank.title.lower())] > 1 else ""
+
+    def tag_span(b):
+        tag = same_name_tag(b)
+        return f" <span class='src'>{tag}</span>" if tag else ""
+
+    def bank_link(b):
+        tag = same_name_tag(b)
+        return (f"<a href='#bank-{anchor_of[id(b)]}'>\u201c{esc(b.bank.title)}\u201d"
+                f"{f' <span class=src>{tag}</span>' if tag else ''}</a>")
+
+    def bank_links(bs, limit=None):
+        bs = sorted(bs, key=lambda b: (b.bank.title.lower(), anchor_of[id(b)]))
+        shown = ", ".join(bank_link(b) for b in bs[:limit])
+        return shown + (f" and {len(bs) - limit} more" if limit and len(bs) > limit else "")
+
+    # same-named banks are the hard case, so those rows also show their first question and a number
     for n, b in enumerate(audit, 1):
         c = b.bank
         verdict = (f"<a href='#bank-{n}'><span class='verdict {b.verdict}'>{VERDICT_LABELS[b.verdict]}</span></a>"
@@ -1810,29 +1919,34 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
         hint = (f"<br><span class='src'>first question: {esc(short(first, 70))}</span>"
                 if first and title_count[(c.source_file, c.title.lower())] > 1 else "")
         audit_rows += (f"<tr><td title='export id {esc(c.cid)}'>[{esc(kind_label('bank', c.engine))}] "
-                       f"<strong>{esc(c.title)}</strong>{source(c)}{hint}</td>"
+                       f"<strong>{esc(c.title)}</strong>{tag_span(b)}"
+                       f"{source(c)}{hint}</td>"
                        f"<td>{c.item_count}</td><td>{esc(b.status)}</td><td>{used_by_cell(b.usage)}</td>"
                        f"<td>{verdict}</td></tr>")
         if not b.verdict:
             continue
         counts = []
         for coverage, label in (("exact", "in use as is"), ("modified", "in use as a modified version"),
-                                ("unused_only", "only in other unlinked banks"), ("unique", "nowhere else")):
+                                ("kept_copy", "in a bank to keep, as is"),
+                                ("kept_version", "in a bank to keep, as a modified version"),
+                                ("unused_only", "also in other unused banks"), ("unique", "nowhere else")):
             if b.count(coverage):
                 counts.append(f"{b.count(coverage)} {label}")
         if b.not_compared:
             counts.append(f"{b.not_compared} not compared (excluded by --exclude-type)")
         lines = ""
         for f in b.findings:
-            if f.coverage == "exact":
+            if f.coverage in ("exact", "kept_copy"):
                 continue
             stem = esc(short(variants[f.variant].rep.text))
+            group = ctx["cluster_of"].get(id(variants[f.variant]))
+            link = f" &middot; <a href='#modified-{group}'>group {group}</a>" if group else ""
             if f.coverage == "modified":
-                group = ctx["cluster_of"].get(id(variants[f.variant]))
-                link = f" &middot; <a href='#modified-{group}'>group {group}</a>" if group else ""
                 where = f"a modified version is in use in {names(f.places)}{link}"
+            elif f.coverage == "kept_version":
+                where = f"a modified version is in a bank to keep: {names(f.places)}{link}"
             elif f.coverage == "unused_only":
-                where = f"also only in: {names(f.places)}"
+                where = f"kept here; also in unused banks: {names(f.places)}"
             else:
                 where = "found nowhere else in the export"
             lines += f"<li>{stem} <span class='src'>&mdash; {where}</span></li>"
@@ -1845,16 +1959,74 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                        f"<p class='src'>{names(in_use)}</p></details>")
         copied = (f"<p class='src'>Questions were copied from it into: {names(b.usage.copied_into)}</p>"
                   if b.usage.copied_into else "")
-        tone = {VERDICT_KEEP: "warn", VERDICT_REVIEW: "near"}.get(b.verdict, "plain")
+        if b.kept_for:
+            copied += f"<p class='src'>Kept as the one copy for: {bank_links(b.kept_for)}</p>"
+        if b.relies_on:
+            copied += f"<p class='src'>Relies on keeping: {bank_links(b.relies_on)}</p>"
+        tone = {VERDICT_UNIQUE: "warn", VERDICT_COPY: "warn", VERDICT_REVIEW: "near"}.get(b.verdict, "plain")
         audit_groups[b.verdict].append(f"""
             <div class="match-group {tone}" id="bank-{n}">
-              <h3>[{esc(kind_label('bank', c.engine))}] <strong>{esc(c.title)}</strong>{source(c)} &middot;
+              <h3>[{esc(kind_label('bank', c.engine))}] <strong>{esc(c.title)}</strong>{tag_span(b)}{source(c)} &middot;
                 {plural(c.size, 'distinct question')} &middot; {esc(b.status)}
                 <span class='verdict {b.verdict}'>{VERDICT_LABELS[b.verdict]}</span></h3>
               <p class='src'>{'; '.join(counts) or 'No questions in the export.'}</p>
               {copied}{detail}
             </div>
             """)
+    # ---- written summary of the verdicts
+    by_verdict = {v: [b for b in audit if b.verdict == v] for v in VERDICT_ORDER}
+
+    def unique_list(banks):
+        """Banks with unique questions, most first, with same-pattern names
+        (chapter_1..., chapter_2...) folded together."""
+        number = r"(?<![A-Za-z])(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|" \
+                 r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)(?![A-Za-z])"
+        families = {}
+        for b in banks:
+            m = re.search(number, b.bank.title, re.I)
+            key = (b.bank.title[:m.start()].strip().lower() + " N") if m else None
+            families.setdefault(key or id(b), []).append(b)
+        entries = []
+        for key, group in families.items():
+            counts = sorted(b.count("unique") for b in group)
+            if isinstance(key, str) and len(group) >= 3:
+                stem = group[0].bank.title[:re.search(number, group[0].bank.title, re.I).start()]
+                each = (f"{counts[0]} each" if counts[0] == counts[-1] else f"{counts[0]}\u2013{counts[-1]} each")
+                all_unique = all(b.count("unique") == b.bank.size for b in group)
+                entries.append((sum(counts), f"the {len(group)} \u201c{esc(stem.strip())} \u2026\u201d banks: "
+                                              f"{each}{', all unique' if all_unique else ''}"))
+            else:
+                for b in group:
+                    entries.append((b.count("unique"), f"{bank_link(b)}: {b.count('unique')}"
+                                                       f"{' (all unique)' if b.count('unique') == b.bank.size else ''}"))
+        entries.sort(key=lambda e: -e[0])
+        shown = "".join(f"<li>{text}</li>" for _, text in entries[:8])
+        if len(entries) > 8:
+            shown += f"<li>and {len(entries) - 8} more</li>"
+        return f"<ul>{shown}</ul>"
+
+    summary_items = ""
+    for v in VERDICT_ORDER:
+        banks = by_verdict[v]
+        if not banks:
+            continue
+        head = (f"<a href='#verdict-{v}'><strong>{len(banks)}</strong> "
+                f"<span class='verdict {v}'>{VERDICT_LABELS[v]}</span></a> {esc(VERDICT_HELP[v])}")
+        extra = ""
+        if v == VERDICT_UNIQUE:
+            total = sum(b.count("unique") for b in banks)
+            head += f" {plural(total, 'question')} in total."
+            extra = unique_list(banks)
+        elif v == VERDICT_COPY:
+            examples = sorted(banks, key=lambda b: (-len(b.kept_for), b.bank.title.lower()))[:3]
+            extra = "<ul>" + "".join(
+                f"<li>Keep {bank_link(b)}; it holds the questions that are otherwise only in "
+                f"{bank_links(b.kept_for, 4)}.</li>" for b in examples if b.kept_for) + "</ul>"
+        elif v in (VERDICT_SAFE, VERDICT_COVERED, VERDICT_REVIEW):
+            extra = f"<p class='src'>{bank_links(banks, 6)}</p>"
+        summary_items += f"<li>{head}{extra}</li>"
+    audit_summary = f"<ul class='audit-summary'>{summary_items}</ul>" if summary_items else ""
+
     refs_note = ""
     if ctx.get("refs_seen"):
         rest = ctx["refs_seen"] - ctx["refs_resolved"]
@@ -1881,14 +2053,10 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
   Otherwise it is <strong>unused</strong>. Usage counts every quiz in the export, including ones left out of the
   comparison with --exclude-title.</p>
   <p>Each bank that is not linked gets a verdict from where its questions also live in the same export.
-  Only quizzes and linked banks count as in use, so two unlinked copies of one bank do not vouch for each other:</p>
-  <ul>
-    <li><span class='verdict safe'>{VERDICT_LABELS[VERDICT_SAFE]}</span> every question is also in use, unchanged.</li>
-    <li><span class='verdict review'>{VERDICT_LABELS[VERDICT_REVIEW]}</span> some questions are in use only as a
-    modified version, so this bank may hold the wording you want to keep. Some questions may also not have been compared.</li>
-    <li><span class='verdict keep'>{VERDICT_LABELS[VERDICT_KEEP]}</span> some questions are nowhere in use: they are
-    unique, or only in other unlinked banks. Deleting every copy loses them.</li>
-  </ul>
+  Only quizzes and linked banks count as in use, so two unused copies of one bank do not vouch for each other.
+  For questions that are not in use anywhere, one bank is picked to keep, so the other copies can go: first
+  every bank holding a question no other bank has, then the bank holding the most of the rest, and so on.</p>
+  {audit_summary}
   <p>A quiz in another course can also draw from a bank, and the export cannot show that.</p>
   {refs_note}
   <table>
@@ -1902,8 +2070,8 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
     if audit:
         linked_n = sum(b.status == USED_LINKED for b in audit)
         bank_summary = (f"{linked_n} of {plural(len(audit), 'bank')} linked to a quiz; the rest: "
-                        + ", ".join(f"{VERDICT_LABELS[v].lower()} {len(audit_groups[v])}" for v in VERDICT_ORDER)
-                        + ".")
+                        + ", ".join(f"{VERDICT_LABELS[v].lower()} {len(audit_groups[v])}"
+                                    for v in VERDICT_ORDER if audit_groups[v]) + ".")
 
     def toc_item(anchor, title, count, sub=""):
         shown = "" if count == "" else f" <span class='src'>{count}</span>"
@@ -1998,7 +2166,12 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
   .verdict {{ display: inline-block; font-size: 0.75rem; font-weight: 600; border-radius: 10px; padding: 0 8px; border: 1px solid var(--border); white-space: nowrap; }}
   .verdict.safe {{ color: var(--key); border-color: var(--key); }}
   .verdict.review {{ color: var(--near-border); border-color: var(--near-border); }}
-  .verdict.keep {{ color: var(--alert); border-color: var(--alert); }}
+  .verdict.unique, .verdict.keep_copy {{ color: var(--alert); border-color: var(--alert); }}
+  .verdict.covered {{ color: var(--key); border-style: dashed; border-color: var(--key); }}
+  .audit-summary > li {{ margin-bottom: 8px; }}
+  .audit-summary a {{ text-decoration: none; }}
+  .audit-summary ul {{ margin: 4px 0 0; padding-left: 20px; font-size: 0.9rem; }}
+  .audit-summary p {{ margin: 2px 0 0; }}
   .verdict.empty {{ color: var(--muted); }}
   .verdict-head {{ margin-top: 1.6rem; }}
   details summary {{ cursor: pointer; font-size: 0.85rem; }}
@@ -2204,7 +2377,8 @@ def main():
     if refs_seen:
         print(f"  {refs_resolved} of {refs_seen} quiz questions that point back to a bank question "
               "found their bank question in the export")
-    print("  Banks not linked: " + ", ".join(f"{VERDICT_LABELS[v].lower()} {verdicts[v]}" for v in VERDICT_ORDER))
+    print("  Banks not linked: " + ", ".join(f"{VERDICT_LABELS[v].lower()} {verdicts[v]}"
+                                             for v in VERDICT_ORDER if verdicts[v]))
 
     # one ordering for both the HTML report and the JSON file
     clusters, lookalikes = order_clusters(clusters), order_clusters(lookalikes)

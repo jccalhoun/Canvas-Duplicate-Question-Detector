@@ -688,18 +688,52 @@ class OrphanBanks(ExportCase):
     def test_verdicts(self):
         audit, _, _ = self.check()
         self.assertEqual({k: b.verdict for k, b in audit.items() if b.verdict},
-                         {"gb": "safe", "gc": "review", "gd": "keep", "ge": "keep", "gf": "keep", "gg": "empty"})
+                         {"gb": "safe", "gc": "review", "gd": "keep_copy", "ge": "covered", "gf": "unique",
+                          "gg": "empty"})
         self.assertEqual(audit["gc"].count("modified"), 1)
         modified = next(f for f in audit["gc"].findings if f.coverage == "modified")
         self.assertEqual(modified.places, ["Persuasion"])
         # Q4 is unique; Q5 was copied into a quiz, so it is in use as is
         self.assertEqual((audit["gf"].count("unique"), audit["gf"].count("exact")), (1, 1))
 
-    def test_unlinked_copies_do_not_vouch_for_each_other(self):
+    def test_unlinked_copies_do_not_vouch_for_each_other_but_one_is_kept(self):
         audit, _, _ = self.check()
-        for cid in ("gd", "ge"):
-            (finding,) = audit[cid].findings
-            self.assertEqual((finding.coverage, finding.places), ("unused_only", ["Old final"]))
+        (kept,) = audit["gd"].findings
+        (other,) = audit["ge"].findings
+        self.assertEqual((kept.coverage, kept.places), ("unused_only", ["Old final"]))
+        self.assertEqual((other.coverage, other.places), ("kept_copy", ["Old final"]))
+        self.assertEqual(audit["gd"].kept_for, [audit["ge"]])
+        self.assertEqual(audit["ge"].relies_on, [audit["gd"]])
+
+    def test_keep_the_bank_holding_the_most(self):
+        q = [item(*self.Q3), item(*self.Q4), item(*self.Q5)]
+        files = {
+            "non_cc_assessments/g1.xml.qti": bank("g1", "Small", [item(*self.Q3)]),
+            "non_cc_assessments/g2.xml.qti": bank("g2", "Big", q),
+            "non_cc_assessments/g3.xml.qti": bank("g3", "Medium", [item(*self.Q4), item(*self.Q5)]),
+        }
+        audit, _, _ = self.check(files)
+        self.assertEqual({k: b.verdict for k, b in audit.items()},
+                         {"g1": "covered", "g2": "keep_copy", "g3": "covered"})
+
+    def test_bank_with_unique_questions_is_kept_first(self):
+        # g2 must stay for its unique Q1, and it also holds Q3, so g1 (only Q3) can go
+        files = {
+            "non_cc_assessments/g1.xml.qti": bank("g1", "A copy", [item(*self.Q3)]),
+            "non_cc_assessments/g2.xml.qti": bank("g2", "B mixed", [item(*self.Q1), item(*self.Q3)]),
+        }
+        audit, _, _ = self.check(files)
+        self.assertEqual((audit["g1"].verdict, audit["g2"].verdict), ("covered", "unique"))
+
+    def test_kept_bank_with_another_version_means_review(self):
+        files = {
+            "non_cc_assessments/g1.xml.qti": bank("g1", "A", [item(*self.Q2), item(*self.Q3)]),
+            "non_cc_assessments/g2.xml.qti": bank("g2", "B", [item(*self.Q2_TWEAKED)]),
+        }
+        audit, _, _ = self.check(files)
+        self.assertEqual((audit["g1"].verdict, audit["g2"].verdict), ("unique", "review"))
+        (finding,) = audit["g2"].findings
+        self.assertEqual(finding.coverage, "kept_version")
 
     def test_unresolved_back_pointer_is_counted_but_not_used(self):
         files = self.course()
@@ -728,6 +762,24 @@ class OrphanBanks(ExportCase):
         _, data = self.run_main("--exclude-type", MC)
         rows = {b["id"]: b for b in data["bank_usage_audit"]}
         self.assertEqual((rows["gb"]["verdict"], rows["gb"]["counts"]["not_compared"]), ("review", 2))
+
+    def test_summary_names_banks_and_folds_numbered_families(self):
+        files = {f"non_cc_assessments/gc{k}.xml.qti": bank(f"gc{k}", f"chapter_{k}-_topic", [item(*q)])
+                 for k, q in enumerate((self.Q1, self.Q3, self.Q4), 1)}
+        files["non_cc_assessments/gx.xml.qti"] = bank("gx", "Lone bank", [item(*self.Q5)])
+        path = self.export(files)
+        out = os.path.join(self.dir, "report.html")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with open(out, encoding="utf-8") as f:
+            report = f.read()
+        summary = report[report.index("class='audit-summary'"):]
+        summary = summary[:summary.index("</ul>\n")]
+        self.assertIn("Has unique questions", summary)
+        self.assertIn(qd.VERDICT_HELP[qd.VERDICT_UNIQUE], summary)
+        self.assertIn("the 3 \u201cchapter_ \u2026\u201d banks: 1 each, all unique", summary)
+        self.assertIn("\u201cLone bank\u201d</a>: 1 (all unique)", summary)
 
     def test_report_links_review_items_to_their_modified_group(self):
         report, data = self.run_main()
