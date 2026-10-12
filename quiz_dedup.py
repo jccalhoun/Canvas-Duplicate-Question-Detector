@@ -1504,6 +1504,137 @@ def esc(s):
     return html.escape(s or "")
 
 
+def filter_attrs(section, titles):
+    """data-section and data-titles attributes for one block of the HTML
+    report, read by the title filter at the top of the page. Titles are
+    lowercased with runs of spaces collapsed, so the page only has to do the
+    same to what is typed."""
+    names = sorted({WS_RE.sub(" ", t).strip().lower() for t in titles if t and t.strip()})
+    return f' data-section="{section}" data-titles="{esc(json.dumps(names, ensure_ascii=False))}"'
+
+
+def variant_titles(variants):
+    """Titles of every quiz and bank the given versions of a question are in."""
+    return {q.quiz_title for v in variants for q in v.occurrences}
+
+
+def bank_spread(variants, containers, cluster_of):
+    """For each bank, keyed (export, bank id): (distinct questions, how many
+    are also stored as is in another quiz or bank, how many are elsewhere only
+    as a modified version). Only questions stored in a quiz or bank count, not
+    ones a quiz draws from a bank, so a bank is not "elsewhere" just because a
+    quiz uses it."""
+    places = [{(q.source_file, q.source_kind, q.quiz_id) for q in v.occurrences} for v in variants]
+    in_bank, by_cluster = {}, {}
+    for i, v in enumerate(variants):
+        for q in v.occurrences:
+            if q.source_kind == "bank":
+                in_bank.setdefault((q.source_file, q.quiz_id), set()).add(i)
+        n = cluster_of.get(id(v))
+        if n is not None:
+            by_cluster.setdefault(n, []).append(i)
+    spread = {}
+    for c in containers:
+        if c.kind != "bank":
+            continue
+        here = (c.source_file, "bank", c.cid)
+        held = in_bank.get((c.source_file, c.cid), set())
+        same = modified = 0
+        for i in held:
+            if places[i] - {here}:
+                same += 1
+            elif any(places[j] - {here} for j in by_cluster.get(cluster_of.get(id(variants[i])), ()) if j != i):
+                modified += 1
+        spread[(c.source_file, c.cid)] = (len(held), same, modified)
+    return spread
+
+
+# The title filter: a search box at the top of the HTML report that hides every
+# block whose quizzes and banks don't match. Each block carries data-section
+# (which part of the report it is in) and data-titles (a JSON list of the quiz
+# and bank titles it involves). Counts marked data-count-for are rewritten to
+# "n of total", data-empty-for notes appear when a section has no match left,
+# and data-hide-if-empty elements (table headers, verdict headings) are hidden.
+FILTER_SCRIPT = r"""
+(function () {
+  var box = document.getElementById('title-filter');
+  var every = document.getElementById('title-filter-all');
+  var status = document.getElementById('title-filter-status');
+  var clear = document.getElementById('title-filter-clear');
+  if (!box) return;
+  var items = Array.prototype.map.call(document.querySelectorAll('[data-titles]'), function (el) {
+    var titles = [];
+    try { titles = JSON.parse(el.getAttribute('data-titles')); } catch (e) {}
+    return { el: el, section: el.getAttribute('data-section'), titles: titles };
+  });
+  var totals = {};
+  items.forEach(function (i) { totals[i.section] = (totals[i.section] || 0) + 1; });
+  var counts = Array.prototype.map.call(document.querySelectorAll('[data-count-for]'), function (el) {
+    return { el: el, section: el.getAttribute('data-count-for'), text: el.textContent };
+  });
+  var empties = document.querySelectorAll('[data-empty-for]');
+  var hideIfEmpty = document.querySelectorAll('[data-hide-if-empty]');
+  var whileFiltering = document.querySelectorAll('[data-hide-when-filtered]');
+
+  function matches(item, q, all) {
+    if (!q) return true;
+    var hit = function (t) { return t.indexOf(q) !== -1; };
+    return all ? item.titles.length > 0 && item.titles.every(hit) : item.titles.some(hit);
+  }
+
+  function apply() {
+    var q = box.value.replace(/\s+/g, ' ').trim().toLowerCase();
+    var all = every.checked;
+    var shown = {}, blocks = 0;
+    items.forEach(function (i) {
+      var on = matches(i, q, all);
+      i.el.hidden = !on;
+      if (on) { shown[i.section] = (shown[i.section] || 0) + 1; blocks++; }
+    });
+    counts.forEach(function (c) {
+      c.el.textContent = q && totals[c.section] ? (shown[c.section] || 0) + ' of ' + totals[c.section] : c.text;
+    });
+    Array.prototype.forEach.call(empties, function (el) {
+      var s = el.getAttribute('data-empty-for');
+      el.hidden = !(q && totals[s] && !shown[s]);
+    });
+    Array.prototype.forEach.call(hideIfEmpty, function (el) {
+      el.hidden = !!(q && !shown[el.getAttribute('data-hide-if-empty')]);
+    });
+    Array.prototype.forEach.call(whileFiltering, function (el) { el.hidden = !!q; });
+    clear.hidden = !q;
+    if (q) {
+      var banks = shown['bank-table'] || 0;
+      status.textContent = 'Showing ' + blocks + ' of ' + items.length + ' items ' +
+        (all ? 'where every quiz and bank has' : 'that involve a quiz or bank with') +
+        ' \u201c' + q + '\u201d in its title' +
+        (totals['bank-table'] ? ' (' + banks + ' matching bank' + (banks === 1 ? '' : 's') + ')' : '') + '.';
+    } else {
+      status.textContent = '';
+    }
+    try {
+      var params = new URLSearchParams(location.search);
+      if (q) params.set('q', box.value.trim()); else params.delete('q');
+      if (all && q) params.set('all', '1'); else params.delete('all');
+      var search = params.toString();
+      history.replaceState(null, '', location.pathname + (search ? '?' + search : '') + location.hash);
+    } catch (e) {}
+  }
+
+  var timer;
+  box.addEventListener('input', function () { clearTimeout(timer); timer = setTimeout(apply, 120); });
+  every.addEventListener('change', apply);
+  clear.addEventListener('click', function () { box.value = ''; apply(); box.focus(); });
+  try {
+    var start = new URLSearchParams(location.search);
+    box.value = start.get('q') || '';
+    every.checked = start.get('all') === '1';
+  } catch (e) {}
+  apply();
+})();
+"""
+
+
 def word_diff(old, new):
     """`new` as HTML, with words added relative to `old` in <ins> and words
     removed in <del>."""
@@ -1752,10 +1883,14 @@ def build_json_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                 "occurrences": sum(len(v.occurrences) for v in group),
                 "versions": versions}
 
+    spread = bank_spread(ctx["variants"], [b.bank for b in ctx.get("bank_audit", [])], ctx.get("cluster_of", {}))
+
     def bank_audit(b):
         out = ref(b.bank)
         u = b.usage
+        _, same, modified = spread.get((b.bank.source_file, b.bank.cid), (0, 0, 0))
         out.update({"questions": b.bank.item_count, "distinct_questions": b.bank.size, "status": b.status,
+                    "also_stored_elsewhere": {"as_is": same, "modified": modified},
                     "linked_by": sorted(u.linked_by, key=str.lower),
                     "questions_chosen_by": sorted(u.picked_by, key=str.lower),
                     "copied_into": sorted(u.copied_into, key=str.lower),
@@ -1817,6 +1952,11 @@ def build_json_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
 def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, same_choice_groups, repeated,
                       identical_containers, container_overlaps, unresolved, threshold,
                       total_questions, total_quizzes, total_banks, ctx):
+    def no_match(section):
+        """Note the title filter shows when it leaves a section empty."""
+        return (f"<p class='empty' data-empty-for='{section}' hidden>"
+                "Nothing here involves a quiz or bank matching the filter.</p>")
+
     def container_label(c):
         src = f" <span class='src'>({esc(c.source_file)})</span>" if ctx["show_source"] else ""
         used = ""
@@ -1845,12 +1985,13 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
             head += (" <span class='src'>&mdash; draws from banks excluded by --exclude-title were not "
                      "compared, so these may still differ there</span>")
         identical_html += f"""
-            <div class="match-group exact">
+            <div class="match-group exact"{filter_attrs("identical", (c.title for c in group))}>
               <h3>{head}</h3>
               <ul class="containers">{rows}</ul>
             </div>
             """
-    identical_html = identical_html or "<p class='empty'>No two quizzes or banks have exactly the same contents.</p>"
+    identical_html = (identical_html + no_match("identical")) if identical_html else \
+        "<p class='empty'>No two quizzes or banks have exactly the same contents.</p>"
 
     # ---- quizzes that pull questions from banks
     built_html = ""
@@ -1870,8 +2011,13 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
             return (f"[{esc(kind_label('bank', bank.engine))}] {esc(bank.title)} "
                     f"<span class='src'>({plural(bank.size, 'question')})</span>")
 
+        def bank_title(c, bank_id):
+            bank = banks.get((c.source_file, bank_id))
+            return bank.title if bank else ctx.get("excluded_banks", {}).get((c.source_file, bank_id), "")
+
         rows = ""
         for c in built:
+            pulled = {bank_title(c, b) for b, _ in c.picks} | {bank_title(c, b) for b, _ in c.draws}
             pulls = ""
             for bank_id, n in sorted(Counter(b for b, _ in c.picks).items(), key=lambda kv: kv[0]):
                 pulls += f"<li>{plural(n, 'chosen question')} from {bank_name(c, bank_id)}</li>"
@@ -1880,7 +2026,8 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                 pulls += f"<li>{amount} from {bank_name(c, bank_id)}</li>"
             note = (f"<li class='src'>{plural(c.lost_picks, 'chosen question')} could not be found in the "
                     "export</li>" if c.lost_picks else "")
-            rows += (f"<tr><td>[{esc(kind_label(c.kind, c.engine))}] <strong>{esc(c.title)}</strong>{source(c)}</td>"
+            rows += (f"<tr{filter_attrs('from-banks', {c.title} | pulled)}>"
+                     f"<td>[{esc(kind_label(c.kind, c.engine))}] <strong>{esc(c.title)}</strong>{source(c)}</td>"
                      f"<td>{c.size}</td><td><ul class='pulls'>{pulls}{note}</ul></td></tr>")
         built_html = f"""
   <h3 id="from-banks">Quizzes that use questions from banks</h3>
@@ -1888,14 +2035,16 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
   set from a bank, and a New Quiz can also use single questions chosen from an item bank.
   Either way the questions are stored in the bank and not in the quiz, so a quiz built this
   way has few or no questions of its own to compare. This is common for New Quizzes.</p>
-  <table>
+  <table data-hide-if-empty="from-banks">
     <tr><th>Quiz</th><th>Own questions</th><th>From banks</th></tr>
     {rows}
   </table>
+  {no_match("from-banks")}
 """
     hollow = [c for c in quizzes if not (c.item_count or c.draws or c.picks)]
     if hollow:
-        names = "".join(f"<li>[{esc(kind_label(c.kind, c.engine))}] <strong>{esc(c.title)}</strong>{source(c)}</li>"
+        names = "".join(f"<li{filter_attrs('nothing-exported', [c.title])}>[{esc(kind_label(c.kind, c.engine))}] "
+                        f"<strong>{esc(c.title)}</strong>{source(c)}</li>"
                         for c in hollow)
         built_html += f"""
   <h3 id="nothing-exported">Quizzes with nothing in the export</h3>
@@ -1903,6 +2052,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
   there was nothing to compare. Either the quiz is empty in Canvas or its content was
   not exported.</p>
   <ul class="containers">{names}</ul>
+  {no_match("nothing-exported")}
 """
 
     overlap_html = ""
@@ -1916,14 +2066,15 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
             rows += (f"<li>{exact + modified} of {c.size} ({percent:.0f}%) are also in "
                      f"{container_label(other)} <span class='src'>&mdash; {detail}</span>{whole}</li>")
         overlap_html += f"""
-            <div class="match-group near">
+            <div class="match-group near"{filter_attrs("mostly-contained", [c.title] + [h[0].title for h in hits])}>
               <h3>{container_label(c)}</h3>
               <ul class="containers">{rows}</ul>
             </div>
             """
-    overlap_html = overlap_html or "<p class='empty'>None found at this setting.</p>"
+    overlap_html = (overlap_html + no_match("mostly-contained")) if overlap_html else \
+        "<p class='empty'>None found at this setting.</p>"
 
-    def render_clusters(groups, empty, anchor=None):
+    def render_clusters(groups, empty, section, anchor=None):
         rendered = []
         for number, cluster in enumerate(groups, 1):
             ref = cluster[0]
@@ -1939,57 +2090,58 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
             total = sum(len(v.occurrences) for v in cluster)
             ident = f' id="{anchor}-{number}"' if anchor else ""
             rendered.append((any_key, total, f"""
-            <div class="match-group {'warn' if any_key else 'near'}"{ident}>
+            <div class="match-group {'warn' if any_key else 'near'}"{ident}{filter_attrs(section, variant_titles(cluster))}>
               <h3>{f"Group {number} &middot; " if anchor else ""}{len(cluster)} versions &middot; {total} occurrences{' &middot; answer key differs' if any_key else ''}</h3>
               <div class="cards">{''.join(cards)}</div>
             </div>
             """))
-        return ("".join(r[2] for r in rendered) or f"<p class='empty'>{empty}</p>",
+        return (("".join(r[2] for r in rendered) + no_match(section)) if rendered else f"<p class='empty'>{empty}</p>",
                 sum(1 for r in rendered if r[0]))
 
     modified_html, key_clusters = render_clusters(clusters, "No modified questions found at these settings.",
-                                                  anchor="modified")
-    lookalike_html, _ = render_clusters(lookalikes, "None found.")
+                                                  "modified", anchor="modified")
+    lookalike_html, _ = render_clusters(lookalikes, "None found.", "similar-wording")
 
     # ---- exact duplicates
     exact_html = ""
     for v in sorted(exact_variants, key=lambda v: -len(v.occurrences)):
         exact_html += f"""
-            <div class="match-group exact">
+            <div class="match-group exact"{filter_attrs("exact", variant_titles([v]))}>
               <div class="cards">{render_variant(v, ctx)}</div>
             </div>
             """
-    exact_html = exact_html or "<p class='empty'>No exact duplicates found.</p>"
+    exact_html = (exact_html + no_match("exact")) if exact_html else "<p class='empty'>No exact duplicates found.</p>"
 
     # ---- same stem, unrelated choices
     unrelated_html = ""
     for group in unrelated_groups:
         cards = "".join(render_variant(v, ctx) for v in group)
         unrelated_html += f"""
-            <div class="match-group plain">
+            <div class="match-group plain"{filter_attrs("same-stem", variant_titles(group))}>
               <div class="cards">{cards}</div>
             </div>
             """
-    unrelated_html = unrelated_html or "<p class='empty'>None found.</p>"
+    unrelated_html = (unrelated_html + no_match("same-stem")) if unrelated_html else "<p class='empty'>None found.</p>"
 
-    def plain_groups(groups):
+    def plain_groups(groups, section):
         out = ""
         for group in groups:
             cards = "".join(render_variant(v, ctx) for v in group)
             out += f"""
-            <div class="match-group plain">
+            <div class="match-group plain"{filter_attrs(section, variant_titles(group))}>
               <div class="cards">{cards}</div>
             </div>
             """
-        return out or "<p class='empty'>None found.</p>"
+        return (out + no_match(section)) if out else "<p class='empty'>None found.</p>"
 
-    same_choice_html = plain_groups(same_choice_groups)
-    repeated_html = plain_groups([[v] for v in repeated])
+    same_choice_html = plain_groups(same_choice_groups, "same-choices")
+    repeated_html = plain_groups([[v] for v in repeated], "repeated")
 
     unresolved_html = ""
     if unresolved:
         rows = "".join(
-            f"<tr><td>{esc(src)}</td><td>{esc(title)}</td><td>{esc(bank)}</td><td>{esc(elsewhere)}</td></tr>"
+            f"<tr{filter_attrs('unresolved', [title])}><td>{esc(src)}</td><td>{esc(title)}</td>"
+            f"<td>{esc(bank)}</td><td>{esc(elsewhere)}</td></tr>"
             for src, title, bank, elsewhere in unresolved
         )
         unresolved_html = f"""
@@ -2000,10 +2152,11 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
         could not be checked. If another export you passed contains a bank with the
         same id, it is named in the last column; that copy was compared, but it may
         not match what this course uses.</p>
-        <table>
+        <table data-hide-if-empty="unresolved">
           <tr><th>Export</th><th>Quiz</th><th>Bank reference id</th><th>Same id found in</th></tr>
           {rows}
         </table>
+        {no_match("unresolved")}
         """
 
     # ---- bank usage and orphan check
@@ -2066,6 +2219,17 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
         shown = ", ".join(bank_link(b) for b in bs[:limit])
         return shown + (f" and {len(bs) - limit} more" if limit and len(bs) > limit else "")
 
+    spread = bank_spread(variants, [b.bank for b in audit], ctx.get("cluster_of", {}))
+
+    def spread_cell(c):
+        held, same, modified = spread.get((c.source_file, c.cid), (0, 0, 0))
+        if not held:
+            return ""
+        if not (same or modified):
+            return f"none of {held}"
+        parts = ([f"{same} as is"] if same else []) + ([f"{modified} modified"] if modified else [])
+        return f"{same + modified} of {held} <span class='src'>({', '.join(parts)})</span>"
+
     # same-named banks are the hard case, so those rows also show their first question and a number
     for n, b in enumerate(audit, 1):
         c = b.bank
@@ -2074,11 +2238,12 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
         first = first_question.get((c.source_file, c.cid), "")
         hint = (f"<br><span class='src'>first question: {esc(short(first, 70))}</span>"
                 if first and title_count[(c.source_file, c.title.lower())] > 1 else "")
-        audit_rows += (f"<tr><td title='export id {esc(c.cid)}'>[{esc(kind_label('bank', c.engine))}] "
+        audit_rows += (f"<tr{filter_attrs('bank-table', [c.title])}>"
+                       f"<td title='export id {esc(c.cid)}'>[{esc(kind_label('bank', c.engine))}] "
                        f"<strong>{esc(c.title)}</strong>{tag_span(b)}"
                        f"{source(c)}{hint}</td>"
-                       f"<td>{c.item_count}</td><td>{esc(b.status)}</td><td>{used_by_cell(b.usage, c.source_file)}</td>"
-                       f"<td>{verdict}</td></tr>")
+                       f"<td>{c.item_count}</td><td>{spread_cell(c)}</td><td>{esc(b.status)}</td>"
+                       f"<td>{used_by_cell(b.usage, c.source_file)}</td><td>{verdict}</td></tr>")
         if not b.verdict:
             continue
         counts = []
@@ -2121,7 +2286,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
             copied += f"<p class='src'>Relies on keeping: {bank_links(b.relies_on)}</p>"
         tone = {VERDICT_UNIQUE: "warn", VERDICT_COPY: "warn", VERDICT_REVIEW: "near"}.get(b.verdict, "plain")
         audit_groups[b.verdict].append(f"""
-            <div class="match-group {tone}" id="bank-{n}">
+            <div class="match-group {tone}" id="bank-{n}"{filter_attrs(f"verdict-{b.verdict}", [c.title])}>
               <h3>[{esc(kind_label('bank', c.engine))}] <strong>{esc(c.title)}</strong>{tag_span(b)}{source(c)} &middot;
                 {plural(c.size, 'distinct question')} &middot; {esc(b.status)}
                 <span class='verdict {b.verdict}'>{VERDICT_LABELS[b.verdict]}</span></h3>
@@ -2216,7 +2381,8 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
     audit_detail = ""
     for v in VERDICT_ORDER:
         if audit_groups[v]:
-            audit_detail += (f'<h3 class="verdict-head" id="verdict-{v}">{VERDICT_LABELS[v]} ({len(audit_groups[v])})</h3>'
+            audit_detail += (f'<h3 class="verdict-head" id="verdict-{v}" data-hide-if-empty="verdict-{v}">'
+                             f'{VERDICT_LABELS[v]} (<span data-count-for="verdict-{v}">{len(audit_groups[v])}</span>)</h3>'
                              + "".join(audit_groups[v]))
     audit_html = ""
     if audit:
@@ -2231,14 +2397,21 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
   Only quizzes and linked banks count as in use, so two unused copies of one bank do not vouch for each other.
   For questions that are not in use anywhere, one bank is picked to keep, so the other copies can go: first
   every bank holding a question no other bank has, then the bank holding the most of the rest, and so on.</p>
+  <div data-hide-when-filtered>
   {audit_summary}
+  </div>
   <p>A quiz in another course can also draw from a bank, and the export cannot show that.
   {published_note}</p>
   {refs_note}
-  <table>
-    <tr><th>Bank</th><th>Questions</th><th>Status</th><th>Used by</th><th>Verdict</th></tr>
+  <p id="bank-table">One row per bank. <strong>Also stored elsewhere</strong> counts the bank's distinct
+  questions that are also stored in another quiz or bank in the comparison, as is or as a modified version.
+  A quiz drawing from this bank does not count, and the questions are only compared after
+  --exclude-type and --exclude-title.</p>
+  <table data-hide-if-empty="bank-table">
+    <tr><th>Bank</th><th>Questions</th><th>Also stored elsewhere</th><th>Status</th><th>Used by</th><th>Verdict</th></tr>
     {audit_rows}
   </table>
+  {no_match("bank-table")}
   {audit_detail}
 """
 
@@ -2249,8 +2422,9 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                         + ", ".join(f"{VERDICT_LABELS[v].lower()} {len(audit_groups[v])}"
                                     for v in VERDICT_ORDER if audit_groups[v]) + ".")
 
-    def toc_item(anchor, title, count, sub=""):
-        shown = "" if count == "" else f" <span class='src'>{count}</span>"
+    def toc_item(anchor, title, count, sub="", section=None):
+        section = section or anchor
+        shown = "" if count == "" else f" <span class='src' data-count-for='{section}'>{count}</span>"
         return f"<li><a href='#{anchor}'>{title}</a>{shown}{sub}</li>"
 
     sub = toc_item("identical", "Exactly the same contents", len(identical_containers))
@@ -2263,8 +2437,8 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
     if audit:
         verdict_sub = "".join(toc_item(f"verdict-{v}", VERDICT_LABELS[v], len(audit_groups[v]))
                               for v in VERDICT_ORDER if audit_groups[v])
-        toc += toc_item("bank-audit", "Bank usage and orphan check", "",
-                        f"<ul>{verdict_sub}</ul>" if verdict_sub else "")
+        toc += toc_item("bank-audit", "Bank usage and orphan check", len(audit),
+                        f"<ul>{verdict_sub}</ul>" if verdict_sub else "", section="bank-table")
     toc += toc_item("quizzes-and-banks", "Duplicate quizzes and banks", "", f"<ul>{sub}</ul>")
     toc += toc_item("modified", "Modified questions", len(clusters))
     toc += toc_item("similar-wording", "Similar wording, different answer", len(lookalikes))
@@ -2310,7 +2484,17 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
   .toc {{ border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; font-size: 0.9rem; }}
   .toc ul {{ margin: 6px 0 0; padding-left: 20px; }}
   a {{ color: inherit; }}
-  h2, h3[id] {{ scroll-margin-top: 12px; }}
+  h2, h3[id], p[id], .match-group[id] {{ scroll-margin-top: 80px; }}
+  [hidden] {{ display: none !important; }}
+  .filter-bar {{ position: sticky; top: 0; z-index: 5; background: var(--bg); padding: 10px 0 8px;
+                 border-bottom: 1px solid var(--border); margin-bottom: 1rem; }}
+  .filter-row {{ display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }}
+  .filter-row input[type=search] {{ flex: 1 1 260px; min-width: 0; font: inherit; padding: 6px 10px;
+                                     border: 1px solid var(--border); border-radius: 6px; background: var(--card-bg); color: var(--fg); }}
+  .filter-row label {{ font-size: 0.85rem; color: var(--muted); white-space: nowrap; }}
+  .filter-row button {{ font: inherit; font-size: 0.85rem; padding: 4px 10px; border: 1px solid var(--border);
+                        border-radius: 6px; background: var(--card-bg); color: var(--fg); cursor: pointer; }}
+  #title-filter-status {{ font-size: 0.85rem; color: var(--muted); margin-top: 4px; min-height: 1.2em; }}
   .summary {{ color: var(--muted); font-size: 0.9rem; margin-bottom: 1.5rem; }}
   .match-group {{ border-radius: 8px; padding: 12px 16px; margin-bottom: 14px; border: 1px solid var(--border); }}
   .match-group.exact {{ background: var(--exact-bg); border-color: var(--exact-border); }}
@@ -2370,6 +2554,16 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
     Threshold {threshold:g}, word overlap {ctx["min_overlap"]:g}. Generated {date.today().isoformat()}.{ctx.get("excluded_note", "")}{ctx.get("image_note", "")}
   </p>
 
+  <div class="filter-bar" role="search">
+    <div class="filter-row">
+      <input id="title-filter" type="search" placeholder="Filter by quiz or bank title, e.g. language"
+             aria-label="Filter by quiz or bank title" autocomplete="off">
+      <label><input id="title-filter-all" type="checkbox"> every quiz and bank in an item must match</label>
+      <button id="title-filter-clear" type="button" hidden>Clear</button>
+    </div>
+    <div id="title-filter-status" aria-live="polite"></div>
+  </div>
+
   <nav class="toc" id="contents">
     <strong>Contents</strong>
     <ul>{toc}</ul>
@@ -2427,6 +2621,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
   {repeated_html}
 
   {unresolved_html}
+<script>{FILTER_SCRIPT}</script>
 </body>
 </html>
 """

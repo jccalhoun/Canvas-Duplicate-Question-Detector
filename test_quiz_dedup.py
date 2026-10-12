@@ -1297,6 +1297,99 @@ class ReviewFixes(ExportCase):
         self.assertIn("(most used)</span>", report([item(MC, STEM, CHOICES, [CHOICES[0]])]))
 
 
+class TitleFilter(ExportCase):
+    """The title filter on the HTML report and the per-bank "also stored
+    elsewhere" counts. The filter itself runs in the browser; these check
+    that every block carries what it reads. Uses the OrphanBanks course."""
+    Q1, Q2, Q2_TWEAKED, Q3, Q4, Q5 = (OrphanBanks.Q1, OrphanBanks.Q2, OrphanBanks.Q2_TWEAKED,
+                                      OrphanBanks.Q3, OrphanBanks.Q4, OrphanBanks.Q5)
+    course, run_main = OrphanBanks.course, OrphanBanks.run_main
+
+    def blocks(self, report):
+        """(tag, data-section, titles) for each element the filter can hide."""
+        from html.parser import HTMLParser
+        found = []
+
+        class Parser(HTMLParser):
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                if "data-titles" in attrs:
+                    found.append((tag, attrs["data-section"], json.loads(attrs["data-titles"])))
+
+        Parser().feed(report)
+        return found
+
+    def test_bank_spread_counts_copies_and_versions_elsewhere(self):
+        path = self.export(self.course())
+        questions, _, _, containers = qd.collect_questions([path])
+        variants = qd.build_variants(questions)
+        clusters, _, _ = qd.find_version_clusters(variants, 85.0)
+        cluster_of = {id(v): n for n, group in enumerate(clusters, 1) for v in group}
+        spread = {cid: counts for (_, cid), counts in qd.bank_spread(variants, containers, cluster_of).items()}
+        self.assertEqual(spread["ga"], (2, 2, 0))
+        self.assertEqual(spread["gc"], (2, 1, 1))  # Q1 as is, the tweaked Q2 as a version of Q2
+        self.assertEqual(spread["gd"], (1, 1, 0))
+        self.assertEqual(spread["gf"], (2, 1, 0))  # Q5 is also in the Fallacies quiz, Q4 nowhere else
+        self.assertEqual(spread["gg"], (0, 0, 0))
+        self.assertNotIn("gq1", spread)  # banks only
+
+    def test_every_block_carries_its_titles(self):
+        report, data = self.run_main()
+        blocks = self.blocks(report)
+        rows = [titles for tag, section, titles in blocks if section == "bank-table"]
+        self.assertEqual(sorted(t for (t,) in rows),
+                         ["empty", "extra", "old final", "old final", "persuasion", "persuasion", "persuasion"])
+        sections = {section for _, section, _ in blocks}
+        self.assertTrue({"bank-table", "modified", "exact"} <= sections)
+        (modified,) = [titles for _, section, titles in blocks if section == "modified"]
+        self.assertEqual(modified, ["persuasion"])
+        exact = [titles for _, section, titles in blocks if section == "exact"]
+        self.assertIn(["extra", "fallacies quiz"], exact)
+        # every section has a count to rewrite and, outside the verdict lists, a note for no match
+        for section in sections:
+            self.assertIn(f"data-count-for='{section}'" if not section.startswith("verdict-")
+                          else f'data-count-for="{section}"', report, section)
+            if not section.startswith("verdict-"):
+                self.assertIn(f"data-empty-for='{section}'", report, section)
+        self.assertIn('id="title-filter"', report)
+        self.assertIn("<script>", report)
+        self.assertIn("Also stored elsewhere", report)
+        extra = next(b for b in data["bank_usage_audit"] if b["id"] == "gf")
+        self.assertEqual(extra["also_stored_elsewhere"], {"as_is": 1, "modified": 0})
+
+    def test_quiz_row_matches_the_banks_it_pulls_from(self):
+        files = self.course()
+        files["non_cc_assessments/gq3.xml.qti"] = quiz("gq3", "Unit 4 quiz", [], draws=[("gd", 1)])
+        path = self.export(files)
+        out = os.path.join(self.dir, "report.html")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with open(out, encoding="utf-8") as f:
+            blocks = self.blocks(f.read())
+        self.assertIn(["old final", "unit 4 quiz"],
+                      [titles for _, section, titles in blocks if section == "from-banks"])
+
+    def test_titles_are_escaped_and_normalised(self):
+        files = self.course()
+        files["non_cc_assessments/gh.xml.qti"] = bank("gh", html.escape('Chapter  "4" <Language> & Words'), [item(*self.Q4)])
+        path = self.export(files)
+        out = os.path.join(self.dir, "report.html")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with open(out, encoding="utf-8") as f:
+            blocks = self.blocks(f.read())
+        self.assertIn(['chapter "4" <language> & words'],
+                      [titles for _, section, titles in blocks if section == "bank-table"])
+
+    def test_no_match_notes_start_hidden(self):
+        import re
+        report, _ = self.run_main()
+        for note in re.findall(r"<p class='empty' data-empty-for='[^']+'[^>]*>", report):
+            self.assertTrue(note.endswith(" hidden>"), note)
+
+
 class Scoring(unittest.TestCase):
     def test_numbers_keep_their_sign_and_shape(self):
         forms = ["5", "-5", ".5", "1.5", "15", "1-5", "\u22125"]
