@@ -848,6 +848,112 @@ class OrphanBanks(ExportCase):
                                                       "found_in_export": 1})
 
 
+def meta(ident, published):
+    """A quiz's assessment_meta.xml, the way a course export writes it."""
+    return (f'<?xml version="1.0" encoding="UTF-8"?>\n<quiz identifier="{ident}" '
+            f'xmlns="http://canvas.instructure.com/xsd/cccv1p0"><title>Quiz</title>'
+            f'<available>{"true" if published else "false"}</available></quiz>')
+
+
+class ReviewFixes2(ExportCase):
+    """Fixes from the second outside review."""
+    Q1, Q3 = OrphanBanks.Q1, OrphanBanks.Q3
+
+    def main(self, files, *extra):
+        path = self.export(files)
+        out, target = os.path.join(self.dir, "report.html"), os.path.join(self.dir, "report.json")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out, "--json", target, *extra]), \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            qd.main()
+        with open(out, encoding="utf-8") as f, open(target, encoding="utf-8") as g:
+            return f.read(), json.load(g), printed.getvalue()
+
+    def test_minus_after_a_letter_is_kept(self):
+        self.assertNotEqual(qd.normalize("x-5"), qd.normalize("x5"))
+        self.assertEqual(qd.normalize("x-5"), qd.normalize("x - 5"))
+        self.assertEqual(qd.normalize("1-5"), qd.normalize("1 - 5"))
+
+    def test_short_plurals_share_a_word(self):
+        self.assertEqual(qd.content_words("cars buses"), qd.content_words("car bus"))
+
+    def test_rewritten_single_row_is_paired_by_elimination(self):
+        ref = [("body movement", "kinesics"), ("use of space", "proxemics"), ("touch", "haptics")]
+        new = [("body movement", "kinesics"), ("use of space", "proxemics"), ("contact between people", "kinesics")]
+        self.assertTrue(qd.pair_key_differs(ref, new))
+        same = ref[:2] + [("contact between people", "haptics")]
+        self.assertFalse(qd.pair_key_differs(ref, same))
+
+    def test_orphan_check_does_not_need_the_container_comparison(self):
+        path = self.export(OrphanBanks().course())
+        questions, _, _, containers = qd.collect_questions([path])
+        usage, _, _ = qd.find_bank_usage(questions, containers)
+        variants = qd.build_variants(questions)
+        _, roots, _ = qd.find_version_clusters(variants, 85.0)
+        audit = {b.bank.cid: b.verdict for b in qd.check_orphan_banks(variants, roots, containers, usage)}
+        self.assertEqual(audit["gb"], "safe")
+        self.assertEqual(audit["gg"], "empty")
+
+    def test_shared_item_id_credits_every_bank(self):
+        q = item(*self.Q1)
+        ident = item_id(q)
+        files = {"non_cc_assessments/ga.xml.qti": bank("ga", "A", [q]),
+                 "non_cc_assessments/gb.xml.qti": bank("gb", "B", [q]),
+                 "non_cc_assessments/gq.xml.qti": quiz("gq", "Quiz", [item(*self.Q1, bank_ref=ident)])}
+        path = self.export(files)
+        questions, _, _, containers = qd.collect_questions([path])
+        usage, seen, resolved = qd.find_bank_usage(questions, containers)
+        self.assertEqual((seen, resolved), (1, 1))
+        self.assertEqual({k[1]: u.status for k, u in usage.items()}, {"ga": "copied only", "gb": "copied only"})
+
+    def test_identical_quizzes_note_excluded_draws(self):
+        items = [item(*q) for q in (OrphanBanks.Q1, OrphanBanks.Q3, OrphanBanks.Q4)]
+        files = {"non_cc_assessments/gx.xml.qti": bank("gx", "Old pool", [item(*OrphanBanks.Q5)]),
+                 "non_cc_assessments/gy.xml.qti": bank("gy", "Other pool", [item(*OrphanBanks.Q2)]),
+                 "non_cc_assessments/q1.xml.qti": quiz("q1", "Quiz one", items, draws=[("gx", 1)]),
+                 "non_cc_assessments/q2.xml.qti": quiz("q2", "Quiz two", items, draws=[("gy", 1)])}
+        report, data, _ = self.main(files, "--exclude-title", "pool")
+        self.assertIn("draws from banks excluded by --exclude-title were not compared", report)
+        quiz_one = next(c for c in data["quizzes_and_banks"] if c["title"] == "Quiz one")
+        self.assertEqual(quiz_one["draws_from_excluded_banks"], 1)
+
+    def test_published_state_and_only_published(self):
+        files = {"non_cc_assessments/ga.xml.qti": bank("ga", "Pool", [item(*self.Q1)]),
+                 "non_cc_assessments/gq.xml.qti": quiz("gq", "Old exam", [], bank_refs=["ga"]),
+                 "gq/assessment_meta.xml": meta("gq", False)}
+        report, data, printed = self.main(files)
+        self.assertIn("Published state read for 1 of 1 quiz: 1 unpublished", printed)
+        self.assertIn("Old exam <span class='src'>(unpublished)</span>", report)
+        (row,) = data["bank_usage_audit"]
+        self.assertEqual(row["status"], "linked")
+        exam = next(c for c in data["quizzes_and_banks"] if c["title"] == "Old exam")
+        self.assertIs(exam["published"], False)
+        _, data, _ = self.main(files, "--only-published")
+        (row,) = data["bank_usage_audit"]
+        self.assertEqual((row["status"], row["verdict"]), ("unused", "unique"))
+        self.assertTrue(data["settings"]["only_published"])
+
+    def test_unpublished_quiz_does_not_cover_a_bank_with_only_published(self):
+        files = {"non_cc_assessments/ga.xml.qti": bank("ga", "Pool", [item(*self.Q1)]),
+                 "non_cc_assessments/gq.xml.qti": quiz("gq", "Old quiz", [item(*self.Q1)]),
+                 "gq/assessment_meta.xml": meta("gq", False)}
+        _, data, _ = self.main(files)
+        self.assertEqual(data["bank_usage_audit"][0]["verdict"], "safe")
+        _, data, _ = self.main(files, "--only-published")
+        self.assertEqual(data["bank_usage_audit"][0]["verdict"], "unique")
+
+    def test_advanced_settings_reach_the_matching(self):
+        items = [item(*q) for q in (OrphanBanks.Q1, OrphanBanks.Q3)]
+        files = {"non_cc_assessments/ga.xml.qti": bank("ga", "A", items),
+                 "non_cc_assessments/gb.xml.qti": bank("gb", "B", [item(*q) for q in (OrphanBanks.Q1, OrphanBanks.Q3)])}
+        _, data, _ = self.main(files)
+        self.assertEqual(data["identical_quizzes_and_banks"], [])  # two questions: below the default of 3
+        _, data, _ = self.main(files, "--min-container", "2")
+        self.assertEqual(len(data["identical_quizzes_and_banks"]), 1)
+        self.assertEqual(data["settings"]["min_container"], 2)
+        _, data, _ = self.main(files)  # the default comes back on the next run
+        self.assertEqual(data["identical_quizzes_and_banks"], [])
+
+
 class Images(ExportCase):
     IMG = '<img src="$IMS-CC-FILEBASE$/{}?canvas_download=1" alt="x"> What is wrong with this slide?'
 

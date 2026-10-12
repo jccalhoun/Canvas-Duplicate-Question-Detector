@@ -192,6 +192,8 @@ def normalize(text):
     # keep what makes two numbers different: -5 is not 5, .5 is not 5,
     # 1.5 is not 15, and 1-5 is not 15
     text = re.sub(r"(?<![\w.])[-\u2212](?=\.?\d)", " minus ", text)
+    # x-5 is not x5: a minus after a letter is kept too
+    text = re.sub(r"(?<=[^\W\d_])\s?[-\u2212]\s?(?=\.?\d)", " minus ", text)
     text = re.sub(r"(?<=\d)[-\u2013](?=\d)", " ", text)
     text = re.sub(r"(?<!\w)\.(?=\d)", "0_", text)
     text = re.sub(r"(?<=\d)\.(?=\d)", "_", text)
@@ -256,6 +258,7 @@ class Container:
     missing_banks: frozenset = frozenset()     # banks it draws from that are not in the export
     item_count: int = 0      # questions stored in it in the export, before any --exclude filter
     members: set = field(default_factory=set)  # variant indexes, filled in when quizzes and banks are compared
+    published: object = None  # True/False for a quiz whose assessment_meta.xml says, None when unknown
 
     @property
     def size(self):
@@ -597,6 +600,26 @@ def resolve_preferred_files(xml_files):
     return list(ident_to_path.values()) + unidentified
 
 
+def read_published(root_dir):
+    """{quiz ident: published?} from the export's assessment_meta.xml files.
+    Canvas writes a quiz's published state there as <available>, under a
+    <quiz identifier="..."> root that matches the quiz's QTI ident. Quizzes
+    with no such file (New Quizzes, quiz-only exports) are left out."""
+    found = {}
+    for dirpath, _, filenames in os.walk(root_dir):
+        if "assessment_meta.xml" not in filenames:
+            continue
+        try:
+            root = ET.parse(os.path.join(dirpath, "assessment_meta.xml")).getroot()
+        except ET.ParseError:
+            continue
+        ident = root.get("identifier", "")
+        for el in root:
+            if local(el.tag) == "available" and ident:
+                found[ident] = (el.text or "").strip().lower() == "true"
+    return found
+
+
 def load_source(path, workdir):
     """Given a zip/imscc file or a directory, return a directory containing its
     extracted contents."""
@@ -637,10 +660,14 @@ def collect_questions(paths, images=None):
                 # sorted, so image names (first one seen wins) don't depend on disk order
                 xml_files = sorted(resolve_preferred_files(find_quiz_xml_files(root_dir)))
                 archive = IMAGES.open(p)
+                published = read_published(root_dir)
                 try:
                     for xf in xml_files:
                         qs, found_here = parse_quiz_xml(xf, label)
                         all_questions.extend(qs)
+                        for c in found_here:
+                            if c.kind == "quiz":
+                                c.published = published.get(c.cid)
                         containers.extend(found_here)
                 finally:
                     if archive is not None:
@@ -700,6 +727,16 @@ WORD_OVERLAP = 60     # default for --word-overlap: how much of the distinctive
 CONTAINER_OVERLAP = 80  # default for --container-overlap: share of a quiz's or
                         # bank's questions that must also be in another one
 MIN_CONTAINER = 3     # quizzes and banks with fewer distinct questions are not compared
+
+# the settings above that can be changed from the command line: (name, default, help)
+ADVANCED_SETTINGS = (
+    ("LOOSE_STEM", LOOSE_STEM, "Stem similarity accepted when the choices match strongly"),
+    ("CHOICES_FLOOR", CHOICES_FLOOR, "Choice similarity accepted when the stems match strongly"),
+    ("BOTH_MARGIN", BOTH_MARGIN, "Points below --threshold at which a stem and choices that both match count"),
+    ("LOOSE_CHOICES", LOOSE_CHOICES, "Similarity for two single choices or matching rows to count as one reworded"),
+    ("STEM_ONLY_MIN", STEM_ONLY_MIN, "Stem similarity needed for questions without choices (true/false, essay)"),
+    ("MIN_CONTAINER", MIN_CONTAINER, "Smallest quiz or bank, in distinct questions, compared as a whole"),
+)
 
 
 @dataclass
@@ -794,7 +831,7 @@ def version_scores(stem_score, va, vb, strict):
     return None
 
 
-SUFFIX_RE = re.compile(r"(?<=\w{4})(?:ing|ed|es|s|e)$")
+SUFFIX_RE = re.compile(r"(?<=\w{3})(?:ing|ed|es|s|e)$")
 
 
 def content_words(stem):
@@ -947,6 +984,20 @@ def find_version_clusters(variants, strict, min_overlap=WORD_OVERLAP):
     return clusters, roots, lookalikes
 
 
+def pair_rows(a, b):
+    """Pair the rows (matching prompts or dropdown blank names) of two
+    versions one-to-one: [(index in a, index in b, score)]. Rows pair when
+    they read alike; when exactly one row is left over on each side, those
+    two pair as well, since in two versions of one question that is the row
+    that was rewritten."""
+    pairs = [(i, j, score) for i, j, score in align_choices(a, b) if score >= LOOSE_CHOICES]
+    left_a = [i for i in range(len(a)) if i not in {p[0] for p in pairs}]
+    left_b = [j for j in range(len(b)) if j not in {p[1] for p in pairs}]
+    if len(left_a) == len(left_b) == 1:
+        pairs.append((left_a[0], left_b[0], 0.0))
+    return pairs
+
+
 def pair_key_differs(ref_pairs, other_pairs, ref_options=(), other_options=()):
     """Key comparison for matching rows and dropdown blanks, given
     [(prompt, answer)] on each side. Prompts are paired one-to-one and so are
@@ -964,9 +1015,8 @@ def pair_key_differs(ref_pairs, other_pairs, ref_options=(), other_options=()):
     o_ans = sorted(a for a in o_all if a not in same_answer)
     same_answer.update({o_ans[j]: r_ans[i] for i, j, score in align_choices(r_ans, o_ans)
                         if score >= LOOSE_CHOICES})
-    rows = align_choices([p for p, _ in ref_pairs], [p for p, _ in other_pairs])
-    for i, j, score in rows:
-        if score >= LOOSE_CHOICES and same_answer.get(other_pairs[j][1]) != ref_pairs[i][1]:
+    for i, j, _ in pair_rows([p for p, _ in ref_pairs], [p for p, _ in other_pairs]):
+        if same_answer.get(other_pairs[j][1]) != ref_pairs[i][1]:
             return True
     return False
 
@@ -1172,17 +1222,19 @@ class BankUsage:
         return USED_COPIED if self.copied_into else UNUSED
 
 
-def find_bank_usage(questions, containers):
+def find_bank_usage(questions, containers, skip=frozenset()):
     """How every bank in the exports is used, worked out before any --exclude
     filter so that a filtered-out quiz still counts as using its banks.
 
     Returns (usage, refs_seen, refs_resolved): usage maps (export, bank id)
     to a BankUsage for every bank; refs_seen is how many quiz questions carry
     a pointer back to a bank question and refs_resolved how many of those
-    point at a bank question that is in the same export."""
+    point at a bank question that is in the same export. Quizzes in `skip`,
+    as (export, quiz id), are left out: --only-published passes the
+    unpublished ones."""
     usage = {(c.source_file, c.cid): BankUsage() for c in containers if c.kind == "bank"}
     for c in containers:
-        if c.kind != "quiz":
+        if c.kind != "quiz" or (c.source_file, c.cid) in skip:
             continue
         for bank_id, _ in c.draws:
             if (c.source_file, bank_id) in usage:
@@ -1190,15 +1242,21 @@ def find_bank_usage(questions, containers):
         for bank_id, _ in c.picks:
             if (c.source_file, bank_id) in usage:
                 usage[(c.source_file, bank_id)].picked_by.add(c.title)
-    bank_of_item = {(q.source_file, q.item_id): q.quiz_id for q in questions if q.source_kind == "bank"}
+    # export item ids are unique in a Canvas export; if two banks ever share
+    # one, the copy is credited to both rather than to whichever came last
+    bank_of_item = {}
+    for q in questions:
+        if q.source_kind == "bank":
+            bank_of_item.setdefault((q.source_file, q.item_id), set()).add(q.quiz_id)
     refs_seen = refs_resolved = 0
     for q in questions:
-        if not q.bank_ref:
+        if not q.bank_ref or (q.source_file, q.quiz_id) in skip:
             continue
         refs_seen += 1
-        bank_id = bank_of_item.get((q.source_file, q.bank_ref))
-        if bank_id is not None and (q.source_file, bank_id) in usage:
+        banks = [b for b in bank_of_item.get((q.source_file, q.bank_ref), ()) if (q.source_file, b) in usage]
+        if banks:
             refs_resolved += 1
+        for bank_id in banks:
             usage[(q.source_file, bank_id)].copied_into.add(q.quiz_title)
     return usage, refs_seen, refs_resolved
 
@@ -1230,7 +1288,7 @@ class BankVerdict:
         return sum(1 for f in self.findings if f.coverage == coverage)
 
 
-def check_orphan_banks(variants, roots, containers, usage, excluded_items=None):
+def check_orphan_banks(variants, roots, containers, usage, excluded_items=None, skip=frozenset()):
     """For each bank in `containers` that no quiz links to, sort its distinct
     questions by where else they live in the same export:
 
@@ -1250,12 +1308,26 @@ def check_orphan_banks(variants, roots, containers, usage, excluded_items=None):
     Returns a BankVerdict for every bank, linked ones included (with no
     verdict), sorted by title. `excluded_items` maps (export, bank id) to how
     many of its questions an --exclude-type filter removed; those could not
-    be checked."""
+    be checked. Quizzes in `skip`, as (export, quiz id), do not count as in
+    use."""
     excluded_items = excluded_items or {}
     linked = {key for key, u in usage.items() if u.status == USED_LINKED}
+    # each bank's distinct questions, worked out here so this does not depend
+    # on find_duplicate_containers() having run first
+    members = {}
+    for idx, v in enumerate(variants):
+        for q in v.occurrences:
+            if q.source_kind == "bank":
+                members.setdefault((q.source_file, q.quiz_id), set()).add(idx)
+    for c in containers:
+        if c.kind == "bank":
+            c.members = members.get((c.source_file, c.cid), set())
 
     def place(q):
         return (q.source_file, q.source_kind, q.quiz_id)
+
+    def skipped(q):
+        return q.source_kind == "quiz" and (q.source_file, q.quiz_id) in skip
 
     def in_use(q):
         return q.source_kind == "quiz" or (q.source_file, q.quiz_id) in linked
@@ -1278,11 +1350,12 @@ def check_orphan_banks(variants, roots, containers, usage, excluded_items=None):
         candidates.append(result)
         here = (c.source_file, "bank", c.cid)
         for idx in sorted(c.members):
+            # a skipped (unpublished) quiz is treated as if it were not there
             elsewhere = [q for q in variants[idx].occurrences
-                         if q.source_file == c.source_file and place(q) != here]
+                         if q.source_file == c.source_file and place(q) != here and not skipped(q)]
             versions = [q for j in by_root.get(roots[idx], ()) if j != idx
                         for q in variants[j].occurrences
-                        if q.source_file == c.source_file and place(q) != here]
+                        if q.source_file == c.source_file and place(q) != here and not skipped(q)]
             if any(in_use(q) for q in elsewhere):
                 finding = BankFinding(idx, "exact", titles(q for q in elsewhere if in_use(q)))
             elif any(in_use(q) for q in versions):
@@ -1464,8 +1537,8 @@ def render_choices(q, ref=None):
             # Prompts are paired the way pair_key_differs() pairs them, so a
             # reworded prompt is diffed in place instead of shown as a removed
             # row and an added one.
-            rows = align_choices([normalize(p) for p, _ in q.key_pairs], [normalize(p) for p, _ in ref.key_pairs])
-            twin = {i: (j, score) for i, j, score in rows if score >= LOOSE_CHOICES}
+            rows = pair_rows([normalize(p) for p, _ in q.key_pairs], [normalize(p) for p, _ in ref.key_pairs])
+            twin = {i: (j, score) for i, j, score in rows}
             paired = {j for j, _ in twin.values()}
             parts = []
             for i, (p, a) in enumerate(q.key_pairs):
@@ -1596,6 +1669,10 @@ def build_json_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
             out["draws"] = [{"bank_id": b, "bank_title": bank_title(c, b), "count": n} for b, n in c.draws]
             out["picks"] = [{"bank_id": b, "bank_title": bank_title(c, b), "item_id": i} for b, i in c.picks]
             out["picks_not_found"] = c.lost_picks
+            # draws from banks left out with --exclude-title are not part of any comparison
+            out["published"] = c.published
+            out["draws_from_excluded_banks"] = sum(1 for b, _ in c.draws
+                                                   if (c.source_file, b) in ctx.get("excluded_banks", {}))
         return out
 
     def question(v):
@@ -1712,6 +1789,10 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                     "that also pull the same number from the same banks")
         else:
             head = f"{len(group)} quizzes that pull the same number of questions from the same banks"
+        excluded = ctx.get("excluded_banks", {})
+        if any((c.source_file, b) in excluded for c in group for b, _ in c.draws):
+            head += (" <span class='src'>&mdash; draws from banks excluded by --exclude-title were not "
+                     "compared, so these may still differ there</span>")
         identical_html += f"""
             <div class="match-group exact">
               <h3>{head}</h3>
@@ -1885,19 +1966,35 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
     def names(titles):
         return esc(", ".join(sorted(titles, key=str.lower)))
 
-    def used_by_cell(u):
+    # quiz titles whose every quiz of that name is unpublished
+    quiz_states = {}
+    for c in ctx["containers"]:
+        if c.kind == "quiz":
+            quiz_states.setdefault((c.source_file, c.title), set()).add(c.published)
+    unpublished_titles = {key for key, states in quiz_states.items() if states == {False}}
+
+    def quiz_names(titles, src):
+        return ", ".join(esc(t) + (" <span class='src'>(unpublished)</span>" if (src, t) in unpublished_titles else "")
+                         for t in sorted(titles, key=str.lower))
+
+    def used_by_cell(u, src):
         parts = []
         if u.linked_by:
-            parts.append(f"group in: {names(u.linked_by)}")
+            parts.append(f"group in: {quiz_names(u.linked_by, src)}")
         if u.picked_by:
-            parts.append(f"questions chosen in: {names(u.picked_by)}")
+            parts.append(f"questions chosen in: {quiz_names(u.picked_by, src)}")
         if u.copied_into:
-            parts.append(f"copied into: {names(u.copied_into)}")
+            parts.append(f"copied into: {quiz_names(u.copied_into, src)}")
         return "<br>".join(parts)
 
     audit_rows = ""
     audit_groups = {v: [] for v in VERDICT_ORDER}
     anchor_of = {id(b): n for n, b in enumerate(audit, 1)}
+    first_question = {}  # (export, bank id) -> text of the first question found in it
+    for v in variants:
+        for q in v.occurrences:
+            if q.source_kind == "bank":
+                first_question.setdefault((q.source_file, q.quiz_id), q.text)
     title_count = Counter((b.bank.source_file, b.bank.title.lower()) for b in audit)
 
     def same_name_tag(b):
@@ -1923,14 +2020,13 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
         c = b.bank
         verdict = (f"<a href='#bank-{n}'><span class='verdict {b.verdict}'>{VERDICT_LABELS[b.verdict]}</span></a>"
                    if b.verdict else "")
-        first = next((q.text for v in variants for q in v.occurrences
-                      if q.source_kind == "bank" and q.quiz_id == c.cid and q.source_file == c.source_file), "")
+        first = first_question.get((c.source_file, c.cid), "")
         hint = (f"<br><span class='src'>first question: {esc(short(first, 70))}</span>"
                 if first and title_count[(c.source_file, c.title.lower())] > 1 else "")
         audit_rows += (f"<tr><td title='export id {esc(c.cid)}'>[{esc(kind_label('bank', c.engine))}] "
                        f"<strong>{esc(c.title)}</strong>{tag_span(b)}"
                        f"{source(c)}{hint}</td>"
-                       f"<td>{c.item_count}</td><td>{esc(b.status)}</td><td>{used_by_cell(b.usage)}</td>"
+                       f"<td>{c.item_count}</td><td>{esc(b.status)}</td><td>{used_by_cell(b.usage, c.source_file)}</td>"
                        f"<td>{verdict}</td></tr>")
         if not b.verdict:
             continue
@@ -2050,6 +2146,11 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
         summary_items += f"<li>{head}{extra}</li>"
     audit_summary = f"<ul class='audit-summary'>{summary_items}</ul>" if summary_items else ""
 
+    published_note = (
+        "Only published quizzes count here (--only-published): a bank used only by unpublished quizzes "
+        "shows as unused, and deleting it breaks those quizzes." if ctx.get("only_published") else
+        "Unpublished quizzes count as using their banks and holding their questions; run with "
+        "--only-published to leave them out.")
     refs_note = ""
     if ctx.get("refs_seen"):
         rest = ctx["refs_seen"] - ctx["refs_resolved"]
@@ -2080,7 +2181,8 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
   For questions that are not in use anywhere, one bank is picked to keep, so the other copies can go: first
   every bank holding a question no other bank has, then the bank holding the most of the rest, and so on.</p>
   {audit_summary}
-  <p>A quiz in another course can also draw from a bank, and the export cannot show that.</p>
+  <p>A quiz in another course can also draw from a bank, and the export cannot show that.
+  {published_note}</p>
   {refs_note}
   <table>
     <tr><th>Bank</th><th>Questions</th><th>Status</th><th>Used by</th><th>Verdict</th></tr>
@@ -2303,18 +2405,44 @@ def main():
                          "short_answer_question, fill_in_multiple_blanks_question, "
                          "multiple_dropdowns_question, numerical_question, calculated_question, "
                          "essay_question, file_upload_question, text_only_question.")
+    ap.add_argument("--only-published", action="store_true",
+                    help="In the bank orphan check, count only published quizzes as using a bank or "
+                         "holding a question. Banks used only by unpublished quizzes then show as unused; "
+                         "deleting them breaks those quizzes. Needs a course export (published state is "
+                         "read from assessment_meta.xml).")
     ap.add_argument("--exclude-title", action="append", default=[], metavar="TEXT",
                     help="Skip quizzes and banks whose title contains TEXT (case-insensitive). Repeatable.")
+    tuning = ap.add_argument_group(
+        "advanced matching settings",
+        "The fixed rules behind --threshold. The defaults were tuned on real course exports; "
+        "see 'How matching works' in the README before changing them.")
+    for name, default, text in ADVANCED_SETTINGS:
+        tuning.add_argument(f"--{name.lower().replace('_', '-')}", type=float, default=default, metavar="N",
+                            help=f"{text} (default {default:g})")
     args = ap.parse_args()
-    for name in ("threshold", "word_overlap", "container_overlap"):
+    for name in ("threshold", "word_overlap", "container_overlap") + tuple(
+            n.lower() for n, _, _ in ADVANCED_SETTINGS if n != "MIN_CONTAINER"):
         if not 0 <= getattr(args, name) <= 100:
             ap.error(f"--{name.replace('_', '-')} must be between 0 and 100")
+    if args.min_container < 1:
+        ap.error("--min-container must be at least 1")
+    # the matching functions read these module settings when they run
+    for name, _, _ in ADVANCED_SETTINGS:
+        value = getattr(args, name.lower())
+        globals()[name] = int(value) if name == "MIN_CONTAINER" else value
 
     print("Parsing exports...")
     images = ImageStore()
     questions, unresolved, bank_usage, containers = collect_questions(args.sources, images)
     # worked out before the filters: a quiz left out of the comparison still uses its banks
-    usage, refs_seen, refs_resolved = find_bank_usage(questions, containers)
+    known = [c for c in containers if c.kind == "quiz" and c.published is not None]
+    unpublished = {(c.source_file, c.cid) for c in known if not c.published}
+    if known:
+        print(f"  Published state read for {len(known)} of "
+              f"{plural(sum(c.kind == 'quiz' for c in containers), 'quiz', 'quizzes')}: "
+              f"{len(unpublished)} unpublished")
+    skip = frozenset(unpublished) if args.only_published else frozenset()
+    usage, refs_seen, refs_resolved = find_bank_usage(questions, containers, skip)
     bank_items = Counter((q.source_file, q.quiz_id) for q in questions if q.source_kind == "bank")
     image_note = ""
     if images.by_content or images.by_name or images.by_address:
@@ -2353,7 +2481,6 @@ def main():
         engine_note = (f" (from New Quizzes: {plural(new_quizzes, 'quiz', 'quizzes')} and "
                        f"{plural(item_banks, 'item bank')})")
         print(f" {engine_note}")
-    holding = {(q.source_file, q.quiz_id) for q in questions if q.source_kind == "quiz"}
     draw_only = sum(1 for c in quizzes if (c.draws or c.picks) and not c.item_count)
     hollow = sum(1 for c in quizzes if not (c.item_count or c.draws or c.picks))
     draw_note = ""
@@ -2392,7 +2519,7 @@ def main():
         variants, roots, args.container_overlap, containers)
     print(f"  {len(identical_containers)} sets of identical quizzes or banks")
     print(f"  {len(container_overlaps)} quizzes or banks mostly contained in another")
-    bank_audit = check_orphan_banks(variants, roots, containers, usage, excluded_items)
+    bank_audit = check_orphan_banks(variants, roots, containers, usage, excluded_items, skip)
     statuses = Counter(b.status for b in bank_audit)
     verdicts = Counter(b.verdict for b in bank_audit if b.verdict)
     print(f"  Banks: {statuses[USED_LINKED]} linked, {statuses[USED_COPIED]} copied only, "
@@ -2400,8 +2527,9 @@ def main():
     if refs_seen:
         print(f"  {refs_resolved} of {refs_seen} quiz questions that point back to a bank question "
               "found their bank question in the export")
-    print("  Banks not linked: " + ", ".join(f"{VERDICT_LABELS[v].lower()} {verdicts[v]}"
-                                             for v in VERDICT_ORDER if verdicts[v]))
+    if verdicts:
+        print("  Banks not linked: " + ", ".join(f"{VERDICT_LABELS[v].lower()} {verdicts[v]}"
+                                                 for v in VERDICT_ORDER if verdicts[v]))
 
     # one ordering for both the HTML report and the JSON file
     clusters, lookalikes = order_clusters(clusters), order_clusters(lookalikes)
@@ -2415,7 +2543,7 @@ def main():
            "engine_note": engine_note, "draw_note": draw_note, "picked_by": picked_by,
            "images": images, "image_note": image_note, "excluded_banks": excluded_banks,
            "variants": variants, "bank_audit": bank_audit, "refs_seen": refs_seen,
-           "refs_resolved": refs_resolved, "cluster_of": cluster_of,
+           "refs_resolved": refs_resolved, "cluster_of": cluster_of, "only_published": args.only_published,
            "classic_quiz_items": classic_quiz_items}
     report = build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, same_choice_groups, repeated,
                                identical_containers, container_overlaps, unresolved, args.threshold,
@@ -2429,7 +2557,9 @@ def main():
                                 for p, label in zip(args.sources, export_labels(args.sources))],
                     "threshold": args.threshold,
                     "word_overlap": args.word_overlap, "container_overlap": args.container_overlap,
-                    "exclude_type": list(args.exclude_type), "exclude_title": list(args.exclude_title)}
+                    "exclude_type": list(args.exclude_type), "exclude_title": list(args.exclude_title),
+                    "only_published": args.only_published,
+                    **{n.lower(): getattr(args, n.lower()) for n, _, _ in ADVANCED_SETTINGS}}
         data = build_json_report(clusters, lookalikes, exact_variants, unrelated_groups, same_choice_groups,
                                  repeated, identical_containers, container_overlaps, unresolved, settings, ctx)
         with open(args.json, "w", encoding="utf-8") as f:

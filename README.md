@@ -55,6 +55,9 @@ python3 quiz_dedup.py fall.imscc spring.imscc -o report.html
 | `--container-overlap` | `80` | List a quiz or bank as mostly contained in another when at least this percent of its questions are also there |
 | `--exclude-type TYPE` | (none) | Skip a question type, such as `essay_question`. Can be repeated. |
 | `--exclude-title TEXT` | (none) | Skip quizzes and banks whose title contains `TEXT` (case-insensitive). Can be repeated. |
+| `--only-published` | off | In the bank orphan check, count only published quizzes as using a bank or holding a question |
+
+The fixed rules behind the threshold (see *How matching works*) can also be changed, with `--loose-stem`, `--choices-floor`, `--both-margin`, `--loose-choices`, `--stem-only-min` and `--min-container`. `--help` lists their defaults. They were tuned on real exports, so change them one at a time and compare reports.
 
 Lower the threshold to catch heavier rewrites; raise it if unrelated questions are being grouped together. Below about 60, expect mostly false matches.
 
@@ -109,7 +112,7 @@ The first section of the report answers one question for every bank: can it be d
 - **copied only**: no quiz links to the bank, but Classic quiz questions were copied from it. The export marks each such quiz question with the bank question it came from (`assessment_question_identifierref`). The quizzes hold their own copies, so they do not need the bank.
 - **unused**: neither.
 
-Usage counts every quiz in the export, including quizzes left out of the comparison with `--exclude-title`: excluding a quiz from the comparison does not stop it using its banks.
+Usage counts every quiz in the export, including quizzes left out of the comparison with `--exclude-title`: excluding a quiz from the comparison does not stop it using its banks. Unpublished quizzes count too, unless you pass `--only-published`.
 
 **Verdict.** For a bank that is not linked, each of its questions is first sorted by where else it is found in the same export:
 
@@ -174,7 +177,7 @@ Two questions are treated as versions of the same question when one of these is 
 - the choices are at least 85% similar and the stems are at least 60% similar
 - the stems and the choices are both at least 75% similar
 
-The 85 is the `--threshold` value, and the 75 is always 10 points below it, so raising the threshold tightens that rule too. The other numbers are constants near the top of the "Version detection" section of the script.
+The 85 is the `--threshold` value, and the 75 is always 10 points below it, so raising the threshold tightens that rule too. The 60s are `--loose-stem` and `--choices-floor`, the 10-point gap is `--both-margin`, and the 90 below is `--stem-only-min`.
 
 Questions where the choices cannot help (true/false, essay, and other types without choices) are compared on the stem alone and must be at least 90% similar.
 
@@ -187,7 +190,7 @@ Two further checks apply when the stems are not worded identically:
 
 Images are compared by content when the image file is in the export: the file is hashed, so the same picture under two file names counts as the same, and two different pictures that share a file name do not. The report shows an image as `[image: name]`, using the first file name seen for that picture, and adds `(2)` when a different picture reuses a name. Equation images are compared by their LaTeX. An image the script can't read (a web address, or a file the export leaves out) is compared by its name. The report's summary says how many images fell into each group. A question whose stem is only an image is kept. Two questions whose stems each show a picture, and not the same pictures, are treated as different questions however alike their wording is, so "What is wrong with this slide?" under two different slides is not grouped. The same goes for answer choices: two choices that show different pictures are never treated as the same choice reworded. A picture added to or removed from a question, including one of several, still counts as an edit.
 
-Choices are paired one-to-one between two versions. The answer key counts as unchanged only when the credited choices are each other's counterparts, so rewording the correct choice is reported as a choice change, while crediting a different or newly added choice is reported as *Answer key differs*. Matching questions work the same way on their rows: rewording a prompt or an answer is a choice change, and a prompt that maps to a different answer is a key change. In the report, a changed row shows its old answer struck out and its new answer highlighted, next to the prompt.
+Choices are paired one-to-one between two versions. The answer key counts as unchanged only when the credited choices are each other's counterparts, so rewording the correct choice is reported as a choice change, while crediting a different or newly added choice is reported as *Answer key differs*. Matching questions work the same way on their rows: rewording a prompt or an answer is a choice change, and a prompt that maps to a different answer is a key change. Rows are paired by how alike their prompts read; when exactly one row on each side is left unpaired, those two are paired too, so a row whose prompt was rewritten past recognition still has its answer compared. In the report, a changed row shows its old answer struck out and its new answer highlighted, next to the prompt.
 
 ## Limitations
 
@@ -196,13 +199,13 @@ Choices are paired one-to-one between two versions. The answer key counts as unc
 - **Course exports only for New Quizzes.** A quiz exported on its own from inside New Quizzes has not been tested.
 - **Banks missing from the export.** Canvas does not always include every question bank in an export. Quizzes that point to a missing bank are listed in the report, but those questions cannot be checked.
 - **Answer keys.** The answer key is read for multiple choice, multiple answers, true/false, short answer, and matching questions. For other types, or when the key cannot be read, the key is not compared, and the question's card says so.
-- **Formatting and punctuation are ignored.** Two questions that differ only in formatting or in punctuation are treated as identical. Numbers keep what distinguishes them, so `1.5`, `15`, `-5`, `.5` and `1-5` all differ, but other math operators are dropped.
+- **Formatting and punctuation are ignored.** Two questions that differ only in formatting or in punctuation are treated as identical. Numbers keep what distinguishes them, so `1.5`, `15`, `-5`, `.5` and `1-5` all differ, and so do `x-5` and `x5`, but other math operators are dropped.
 - **Numerical ranges are not read.** For a numerical question whose answer is a range, the key is not compared.
 - **Different pictures are never grouped.** If a question was reworded and its picture was replaced at the same time, the two versions are reported as separate questions. When they share the same choices and answer, they appear under *Same choices and answer, different stem*.
 - **Images missing from the export are compared by name.** For those, the same picture under a different file name looks like an edit, and a replaced picture that kept its file name does not. Keep the image files in the export to avoid this. Pictures that look alike but are not the same file, such as a resized copy, count as different.
 - **Item ids are export ids.** They identify a question inside the export file and are not the ids Canvas shows in its own pages.
 - **Usage in other courses is not visible.** A Classic quiz group can draw from a bank in another course, so a bank shown here as unused may still be used from elsewhere.
-- **Every quiz counts as in use.** The export does not say whether a quiz is published or still given, so a question found only in an old quiz still makes a bank look covered.
+- **Unpublished quizzes count as in use unless you say otherwise.** A course export records whether each Classic quiz is published, and the report marks unpublished quizzes in the *Used by* column. By default they still count, since deleting a bank they draw from breaks them. With `--only-published` they are treated as absent from the orphan check: they neither use a bank nor hold a question. New Quizzes, and quizzes in a quiz-only export, have no published state in the export and always count.
 - **Same-named identical banks cannot be told apart in the export.** If one copy is linked and another is not, find the linked one in Canvas from the quiz's question group before deleting.
 - **Bank usage is per bank, not per question.** A quiz group draws a random set from a bank, so "drawn on by" means the quiz can pull any question in that bank.
 - **No choices found.** If a multiple choice, true/false, or matching question has no readable choices in the export, its card says so and only its wording is compared. This usually means the question itself is empty.
