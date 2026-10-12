@@ -1460,6 +1460,69 @@ class QuizCoverageCheck(ExportCase):
         self.assertIn(["old pool"], [titles for _, section, titles in TitleFilter.blocks(None, report)
                                      if section == "quiz-coverage"])
 
+    def card(self, report, title):
+        start = report.index(f"<strong>{title}</strong>")
+        return report[start:report.index("</div>", start)]
+
+    def test_strong_warning_only_when_a_bank_is_marked_safe(self):
+        q7 = (MC, "Hearing is a physiological process; listening is what?",
+              ["A psychological process", "A reflex", "A habit", "An accident"], ["A psychological process"])
+        files = self.course()
+        files["non_cc_assessments/gu.xml.qti"] = bank("gu", "Keeper", [item(*self.Q6), item(*q7)])
+        files["non_cc_assessments/gq8.xml.qti"] = quiz("gq8", "Listening quiz", [item(*self.Q6)])
+        path = self.export(files)
+        out = os.path.join(self.dir, "report.html")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with open(out, encoding="utf-8") as f:
+            report = f.read()
+        # Keeper still has a question no quiz holds, so it is not called safe and the note stays plain
+        listening = self.card(report, "Listening quiz")
+        self.assertIn("1 question is only in banks no quiz links to:</strong> Keeper", listening)
+        self.assertIn("(Has unique questions)", listening)
+        self.assertNotIn("coverage-warn", listening)
+        # Old pool's Q3 is only in the two Old final banks, which its copy makes safe to delete
+        old_pool = self.card(report, "Old pool")
+        self.assertIn("coverage-warn", old_pool)
+        self.assertIn("For 1 question this quiz is the only quiz with a copy", old_pool)
+
+    def test_no_strong_warning_when_another_quiz_also_has_a_copy(self):
+        # the Fallacies quiz copy of Q5 is only in Extra; a second quiz with the same copy means
+        # deleting either quiz alone loses nothing
+        files = self.course()
+        files["non_cc_assessments/gq6.xml.qti"] = quiz("gq6", "Fallacies quiz 2", [item(*self.Q5)])
+        path = self.export(files)
+        out = os.path.join(self.dir, "report.html")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with open(out, encoding="utf-8") as f:
+            report = f.read()
+        card = self.card(report, "Fallacies quiz 2")
+        self.assertIn("only in banks no quiz links to", card)
+        self.assertNotIn("coverage-warn", card)
+
+    def test_same_named_quizzes_are_numbered(self):
+        files = self.course()
+        files["non_cc_assessments/gq7.xml.qti"] = quiz("gq7", "Old pool", [item(*self.Q6)])
+        path = self.export(files)
+        out = os.path.join(self.dir, "report.html")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with open(out, encoding="utf-8") as f:
+            report = f.read()
+        heads = [h for h in report.split("<strong>Old pool</strong>")[1:]]
+        self.assertEqual(len(heads), 2)
+        for h in heads:
+            self.assertTrue(h.startswith(" <span class='src'>#"), h[:60])
+            self.assertIn("first question: ", h[:600])
+
+    def test_canvas_error_type_is_explained(self):
+        self.assertIn("could not export", qd.type_label("Error"))
+        self.assertEqual(qd.type_label(MC), MC)
+
 
 class Scoring(unittest.TestCase):
     def test_numbers_keep_their_sign_and_shape(self):
