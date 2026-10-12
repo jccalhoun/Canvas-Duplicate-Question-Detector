@@ -80,6 +80,26 @@ In the **Modified questions** section, each group is one question:
 
 Groups where the versions disagree on the answer key are listed first, since one of the versions may be wrong.
 
+### Filtering by quiz or bank title
+
+The box at the top of the report filters it by title as you type. Type `language` and every section shows only the items that involve a quiz or bank with "language" in its title. Matching ignores capital letters. The box stays at the top of the page as you scroll.
+
+The filter only changes what is shown. Every question was still compared with every other, so a Language bank's questions still turn up next to their copies in banks with other names, such as "Final 2019". That is usually what you want when consolidating banks.
+
+What counts as an item:
+
+| Section | An item | The titles it matches on |
+|---|---|---|
+| Bank table | one bank | the bank's title |
+| Bank verdict lists | one bank | the bank's title |
+| Quizzes that use questions from banks | one quiz | the quiz and the banks it draws from |
+| Identical, mostly contained | one group | every quiz and bank in the group |
+| Question lists (modified, exact, and the rest) | one group or question | every quiz and bank the question is in |
+
+By default an item is shown when **any** of its titles matches. Tick **every quiz and bank in an item must match** to show only items that stay entirely within matching quizzes and banks. For example, duplicates among your Language banks that appear nowhere else.
+
+While a filter is on, the counts in the contents read "2 of 4", and a section with no match says so. The verdict summary at the top of the bank section is hidden, because it describes every bank. The filter is saved in the page address (`report.html?q=language`), so a filtered view can be bookmarked or sent as a link alongside the file.
+
 ## JSON output
 
 ```
@@ -91,7 +111,7 @@ The JSON file holds the same findings as the HTML report, in the same order, for
 | Key | Contents |
 | --- | --- |
 | `generated`, `settings`, `summary`, `question_images` | Run date, the options used, overall counts, and how question images were compared |
-| `bank_usage_audit`, `classic_bank_links` | Each bank's usage status, orphan verdict, the kept banks it relies on or is kept for, and how many quiz questions point back to a bank question |
+| `bank_usage_audit`, `classic_bank_links` | Each bank's usage status, orphan verdict, how many of its questions are also stored elsewhere (`also_stored_elsewhere`), the kept banks it relies on or is kept for, and how many quiz questions point back to a bank question |
 | `quizzes_and_banks` | Every quiz and bank, with what each quiz draws or uses from banks |
 | `identical_quizzes_and_banks`, `mostly_contained`, `quizzes_with_nothing_in_export` | The whole-quiz and whole-bank findings |
 | `modified_questions`, `similar_wording_different_answer` | Clusters of versions |
@@ -135,6 +155,8 @@ Only quizzes and linked banks count as in use. Otherwise two unused copies of on
 | **Safe to delete if the kept copies stay** | every question is in use or in a bank to keep, unchanged |
 | **Safe to delete** | every question is in use, unchanged, somewhere else |
 | **Empty in the export** | the bank has no questions in the export |
+
+**Bank table.** One row per bank, with its question count, status, the quizzes that use it, and its verdict. The **Also stored elsewhere** column counts the bank's distinct questions that are also stored in another quiz or bank, as is or only as a modified version. For example, `3 of 5 (2 as is, 1 modified)`. This covers linked banks too, so it shows how much a bank shares with others even when a quiz still uses it. A quiz drawing from the bank does not count as "elsewhere", and questions removed with `--exclude-type` or `--exclude-title` are not counted.
 
 The section opens with a summary of each verdict and the banks in it. Banks with unique questions are listed by how many they hold, with numbered families such as `chapter_1-...`, `chapter_2-...` folded into one line. Each *keep as the one copy* example names the banks that rely on it. When several banks share a title, each gets a number (`#12`) used everywhere in the section, and the table also shows its first question.
 
