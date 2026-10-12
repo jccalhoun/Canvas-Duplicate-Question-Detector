@@ -1005,6 +1005,17 @@ class ReviewFixes4(ExportCase):
         self.assertIn("x < 3 and y > 5", q.choices)
         self.assertIn("x < 3 and y > 5", q.correct)
 
+    def test_plain_text_entities_are_decoded(self):
+        # a real export had one copy of a choice as text/plain with a trailing &nbsp;
+        plain = item(MC, "Which is true?", ["Alpha one", "Beta two"], ["Alpha one"]).replace(
+            '<mattext texttype="text/html">Beta two</mattext>',
+            '<mattext texttype="text/plain">Beta two&amp;nbsp;</mattext>')
+        html_copy = item(MC, "Which is true?", ["Alpha one", "Beta two"], ["Alpha one"])
+        questions, _, _, _ = qd.collect_questions([self.export(
+            {"non_cc_assessments/gb.xml.qti": bank("gb", "B", [plain, html_copy])})])
+        self.assertEqual(questions[0].choices, ["Alpha one", "Beta two"])
+        self.assertEqual(len(qd.build_variants(questions)), 1)
+
     def test_every_stem_block_and_nested_text_is_read(self):
         xml = item(MC, "First paragraph.", ["A one", "B two"], ["A one"]).replace(
             "<presentation>", "<presentation><material><mattext>Read <b>this</b> case.</mattext></material>", 1)

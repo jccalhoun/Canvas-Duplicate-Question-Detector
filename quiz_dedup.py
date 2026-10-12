@@ -307,8 +307,9 @@ def local(tag):
 
 def extract_mattext(material_el):
     """Plain text of a <material>: every <mattext> in it, in order. HTML
-    mattext is stripped of its markup; text/plain mattext is taken as it is,
-    so a plain-text answer such as "x < 3 and y > 5" keeps its signs. Markup
+    mattext is stripped of its markup; text/plain mattext only has its
+    entities decoded, so a plain-text answer such as "x < 3 and y > 5" keeps
+    its signs. Markup
     written as XML elements inside a mattext (rather than escaped text) is
     kept too, so text after a nested element is not lost."""
     if material_el is None:
@@ -319,7 +320,8 @@ def extract_mattext(material_el):
             continue
         raw = (child.text or "") + "".join(ET.tostring(c, encoding="unicode") for c in child)
         if (child.get("texttype") or "").lower() == "text/plain" and not len(child):
-            parts.append(WS_RE.sub(" ", raw).strip())
+            # no tags to remove, but Canvas still writes entities such as &nbsp; in plain text
+            parts.append(WS_RE.sub(" ", html.unescape(raw)).strip())
         else:
             parts.append(strip_html(raw))
     return " ".join(p for p in parts if p)
