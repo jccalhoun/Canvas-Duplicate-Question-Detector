@@ -1145,8 +1145,9 @@ VERDICT_LABELS = {
 }
 VERDICT_HELP = {
     VERDICT_SAFE: "Every question in them is in use, unchanged, somewhere else.",
-    VERDICT_COVERED: ("Every question in them is in use or in a bank marked \u201ckeep as the one copy\u201d, "
-                      "unchanged. They can go as long as those banks stay."),
+    VERDICT_COVERED: ("Every question in them is in use or in a bank to keep (\u201ckeep as the one copy\u201d "
+                      "or \u201chas unique questions\u201d), unchanged. They can go as long as those banks stay; "
+                      "each one\u2019s card says which."),
     VERDICT_REVIEW: ("Some questions survive only as modified versions, in use or in a bank to keep, so one of "
                      "these banks may hold the wording you want."),
     VERDICT_UNIQUE: ("They hold questions found nowhere else in the export. Whether to keep them depends on "
@@ -1459,19 +1460,27 @@ def render_choices(q, ref=None):
         theirs = {normalize(k) for k in ref.correct} if ref is not None and ref.correct else None
         mine = {normalize(k) for k in q.correct}
         if ref is not None and q.key_pairs and ref.key_pairs:
-            # rows and blanks: show a changed answer in place, next to its prompt
-            old = {normalize(p): a for p, a in ref.key_pairs}
-            seen = {normalize(p) for p, _ in q.key_pairs}
+            # rows and blanks: show a changed answer in place, next to its prompt.
+            # Prompts are paired the way pair_key_differs() pairs them, so a
+            # reworded prompt is diffed in place instead of shown as a removed
+            # row and an added one.
+            rows = align_choices([normalize(p) for p, _ in q.key_pairs], [normalize(p) for p, _ in ref.key_pairs])
+            twin = {i: (j, score) for i, j, score in rows if score >= LOOSE_CHOICES}
+            paired = {j for j, _ in twin.values()}
             parts = []
-            for p, a in q.key_pairs:
-                was = old.get(normalize(p))
-                if was is None:
+            for i, (p, a) in enumerate(q.key_pairs):
+                if i not in twin:
                     parts.append(f"<ins>{esc(p)} \u2192 {esc(a)}</ins>")
-                elif normalize(was) != normalize(a):
-                    parts.append(f"{esc(p)} \u2192 <del>{esc(was)}</del> <ins>{esc(a)}</ins>")
+                    continue
+                j, score = twin[i]
+                old_p, was = ref.key_pairs[j]
+                prompt = esc(p) if score >= 100 else word_diff(old_p, p)
+                if normalize(was) != normalize(a):
+                    parts.append(f"{prompt} \u2192 <del>{esc(was)}</del> <ins>{esc(a)}</ins>")
                 else:
-                    parts.append(f"{esc(p)} \u2192 {esc(a)}")
-            parts += [f"<del>{esc(p)} \u2192 {esc(a)}</del>" for p, a in ref.key_pairs if normalize(p) not in seen]
+                    parts.append(f"{prompt} \u2192 {esc(a)}")
+            parts += [f"<del>{esc(p)} \u2192 {esc(a)}</del>" for j, (p, a) in enumerate(ref.key_pairs)
+                      if j not in paired]
         else:
             parts = [f"<ins>{esc(k)}</ins>" if theirs is not None and normalize(k) not in theirs else esc(k)
                      for k in q.correct]
@@ -2032,7 +2041,10 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                  f"questions found nowhere else in use: {bank_links(b.kept_for, 4)}.</li>" if b.kept_for else
                  f"<li>Keep {bank_link(b)}. It holds questions that are otherwise only in other banks "
                  f"kept as the one copy.</li>")
-                for b in examples) + "</ul>"
+                for b in examples)
+            if len(banks) > len(examples):
+                extra += f"<li>and {len(banks) - len(examples)} more</li>"
+            extra += "</ul>"
         elif v in (VERDICT_SAFE, VERDICT_COVERED, VERDICT_REVIEW):
             extra = f"<p class='src'>{bank_links(banks, 6)}</p>"
         summary_items += f"<li>{head}{extra}</li>"
@@ -2124,7 +2136,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
     --warn-bg: #fff0e0; --warn-border: #e08a3d;
     --card-bg: #fafafa;
     --ins-bg: #d4f5d4; --ins-fg: #14501a; --del-bg: #fbdada; --del-fg: #8a1f1f;
-    --alert: #c62828; --key: #2e7d32;
+    --alert: #c62828; --key: #2e7d32; --review-fg: #8a6400;
   }}
   @media (prefers-color-scheme: dark) {{
     :root {{
@@ -2134,7 +2146,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
       --warn-bg: #2a1f0f; --warn-border: #a5723d;
       --card-bg: #232323;
       --ins-bg: #1e4023; --ins-fg: #b9f0bf; --del-bg: #4a2020; --del-fg: #f5b5b5;
-      --alert: #ef6c6c; --key: #7fd087;
+      --alert: #ef6c6c; --key: #7fd087; --review-fg: #e0c34a;
     }}
   }}
   body {{ background: var(--bg); color: var(--fg); font-family: -apple-system, Segoe UI, Roboto, sans-serif; max-width: 900px; margin: 0 auto; padding: 24px 16px 80px; line-height: 1.5; }}
@@ -2176,7 +2188,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
   .empty {{ color: var(--muted); font-style: italic; }}
   .verdict {{ display: inline-block; font-size: 0.75rem; font-weight: 600; border-radius: 10px; padding: 0 8px; border: 1px solid var(--border); white-space: nowrap; }}
   .verdict.safe {{ color: var(--key); border-color: var(--key); }}
-  .verdict.review {{ color: var(--near-border); border-color: var(--near-border); }}
+  .verdict.review {{ color: var(--review-fg); border-color: var(--review-fg); }}
   .verdict.unique, .verdict.keep_copy {{ color: var(--alert); border-color: var(--alert); }}
   .verdict.covered {{ color: var(--key); border-style: dashed; border-color: var(--key); }}
   .audit-summary > li {{ margin-bottom: 8px; }}
