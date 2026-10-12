@@ -781,6 +781,40 @@ class OrphanBanks(ExportCase):
         self.assertIn("the 3 \u201cchapter_N-_\u2026\u201d banks: 1 each, all unique", summary)
         self.assertIn("\u201cLone bank\u201d</a>: 1 (all unique)", summary)
 
+    def test_review_badge_is_readable(self):
+        report, _ = self.run_main()
+        self.assertIn(".verdict.review {{ color: var(--review-fg)".replace("{{", "{"), report)
+        self.assertIn("--review-fg: #8a6400", report)
+
+    def test_every_kept_bank_is_counted_in_the_summary(self):
+        # nine pairs of unused banks, each pair sharing a question no quiz uses
+        questions = [
+            ("Ethos rests on what?", ["Credibility", "Emotion", "Logic"]),
+            ("Name the first step of Monroe's sequence.", ["Attention", "Need", "Action"]),
+            ("Proxemics studies which cue?", ["Space", "Touch", "Time"]),
+            ("A thesis statement belongs where?", ["Introduction", "Body", "Appendix"]),
+            ("What lowers speech anxiety most reliably?", ["Rehearsal", "Caffeine", "Memorizing jokes"]),
+            ("Ad hominem attacks whom?", ["The person", "The data", "The venue"]),
+            ("Paraphrasing helps listeners do what?", ["Confirm meaning", "Interrupt", "Daydream"]),
+            ("Chronemics concerns which resource?", ["Time", "Color", "Smell"]),
+            ("Which visual aid suits trends over years?", ["Line graph", "Pie chart", "Photograph"]),
+        ]
+        files = {}
+        for k, (stem, choices) in enumerate(questions):
+            for side in "ab":
+                files[f"non_cc_assessments/g{k}{side}.xml.qti"] = bank(
+                    f"g{k}{side}", f"Bank {k} {side}", [item(MC, stem, choices, [choices[0]])])
+        path = self.export(files)
+        out = os.path.join(self.dir, "report.html")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with open(out, encoding="utf-8") as f:
+            report = f.read()
+        summary = report[report.index("class='audit-summary'"):]
+        self.assertIn("<strong>9</strong> <span class='verdict keep_copy'>", summary)
+        self.assertIn("<li>and 1 more</li>", summary)
+
     def test_families_need_a_word_first_and_the_same_punctuation(self):
         qs = [self.Q1, self.Q3, self.Q4, self.Q5, self.Q2,
               (MC, "Which outline lists only key words?", ["Speaking outline", "Formal outline", "Rough outline"],
@@ -983,6 +1017,22 @@ class ReviewFixes(ExportCase):
         self.assertIn("Use of personal space \u2192 <del>Proxemics</del> <ins>Haptics</ins>", report)
         self.assertIn("; Use of time \u2192 Chronemics", report)
         self.assertNotIn("<del>Communication through touch", report)
+
+    def test_reworded_matching_prompt_is_diffed_in_place_in_the_key_line(self):
+        rows = [("Communication through touch", "Haptics"), ("Use of personal space", "Proxemics"),
+                ("Use of time", "Chronemics"), ("Body movement", "Kinesics")]
+        reworded = rows[:3] + [("Body movements", "Kinesics")]
+        variants = qd.build_variants(qd.collect_questions([self.export({
+            "non_cc_assessments/gb.xml.qti": bank("gb", "Bank", [
+                item("matching_question", "Match each term.", rows=rows),
+                item("matching_question", "Match each term.", rows=reworded)])})])[0])
+        ref, new = (v.rep for v in sorted(variants, key=lambda v: len(v.rep.choices[3])))
+        keyline = qd.render_choices(new, ref)
+        keyline = keyline[keyline.index("Answer key"):]
+        self.assertIn("Body <del>movement</del> <ins>movements</ins> \u2192 Kinesics", keyline)
+        self.assertNotIn("<del>Body movement \u2192", keyline)
+        self.assertNotIn("<ins>Body movements \u2192", keyline)
+        self.assertFalse(qd.key_differs(ref, new))
 
     def test_matching_key_moved_to_an_unused_lookalike_option(self):
         ref = [("p1", "apple"), ("p2", "banana"), ("p3", "mitosis phase i")]
