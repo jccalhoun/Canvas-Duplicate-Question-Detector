@@ -1504,6 +1504,15 @@ def esc(s):
     return html.escape(s or "")
 
 
+def type_label(qtype):
+    """A question type as shown in the HTML report. Canvas writes "Error"
+    for a question it could not export, with only the question text and no
+    choices or answer key, so the report says that instead."""
+    if qtype == "Error":
+        return "Error: Canvas could not export this question, so only its text was compared"
+    return qtype
+
+
 def filter_attrs(section, titles):
     """data-section and data-titles attributes for one block of the HTML
     report, read by the title filter at the top of the page. Titles are
@@ -1817,7 +1826,7 @@ def render_variant(variant, ctx, heading="", ref=None, badges=""):
     return f"""
     <div class="qcard">
       {head}
-      <div class="qmeta">{esc(q.question_type)}{points}</div>
+      <div class="qmeta">{esc(type_label(q.question_type))}{points}</div>
       <div class="qtext">{stem}</div>
       {render_choices(q, ref.rep if ref is not None else None)}
       {render_locations(variant, ctx)}
@@ -2506,8 +2515,18 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
         return "<ul class='containers'>" + "".join(f"<li>{e}</li>" for e in entries) + "</ul>"
 
     coverage_cards = ""
+    quiz_title_count = Counter((cov.quiz.source_file, cov.quiz.title.lower()) for cov in coverage)
     for n, cov in enumerate(coverage, 1):
         c = cov.quiz
+        same_name, hint = "", ""
+        if quiz_title_count[(c.source_file, c.title.lower())] > 1:
+            same_name = f" <span class='src'>#{n}</span>"
+            first = min((q for i in cov.in_linked + list(cov.in_unlinked) + list(cov.modified) + cov.missing
+                         for q in variants[i].occurrences
+                         if q.source_kind == "quiz" and (q.source_file, q.quiz_id) == (c.source_file, c.cid)),
+                        key=lambda q: q.item_id, default=None)
+            if first is not None:
+                hint = f"<p class='src'>first question: {esc(short(first.text, 70))}</p>"
         stored = sum(1 for i in (cov.in_linked + list(cov.in_unlinked) + list(cov.modified) + cov.missing)
                      for q in variants[i].occurrences
                      if q.source_kind == "quiz" and (q.source_file, q.quiz_id) == (c.source_file, c.cid))
@@ -2529,10 +2548,26 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                 f"{bank_desc(k)}: {per_bank[k]}{only_here(k)}"
                 for k in sorted(per_bank, key=lambda k: (-per_bank[k], bank_titles.get(k, "").lower())))
             count = len(cov.in_unlinked)
-            notes += (f"<p class='coverage-warn'><strong>{plural(count, 'question')} {'is' if count == 1 else 'are'} "
-                      f"only in banks no quiz links to:</strong> {banks_text}. The bank check may call those banks safe to delete because "
-                      "this quiz holds copies of their questions. Delete the quiz and those banks together and "
-                      "these questions are gone.</p>")
+            head = (f"{plural(count, 'question')} {'is' if count == 1 else 'are'} only in banks no quiz links to:"
+                    f"</strong> {banks_text}.")
+            # the quiz's copy is what keeps such a question "in use" when no other quiz holds it,
+            # so a bank called safe to delete on the strength of it is the risky case
+            here = (c.source_file, c.cid)
+            sole_copy = [i for i in cov.in_unlinked
+                         if not any(q.source_kind == "quiz" and (q.source_file, q.quiz_id) != here
+                                    for q in variants[i].occurrences)]
+            safe = {k for i in sole_copy for k in cov.in_unlinked[i]
+                    if bank_info.get(k) and bank_info[k].verdict in (VERDICT_SAFE, VERDICT_COVERED)}
+            at_risk = sum(1 for i in sole_copy if safe & set(cov.in_unlinked[i]))
+            if safe:
+                names = ", ".join(f"{esc(bank_titles.get(k, k[1]))}{tag_span(bank_info[k])}"
+                                  for k in sorted(safe, key=lambda k: bank_titles.get(k, "").lower()))
+                notes += (f"<p class='coverage-warn'><strong>{head} For {plural(at_risk, 'question')} this quiz is "
+                          f"the only quiz with a copy, and the bank check calls {names} safe to delete because of "
+                          f"that copy. Delete this quiz and {'that bank' if len(safe) == 1 else 'those banks'} "
+                          f"and {'it is' if at_risk == 1 else 'they are'} gone.</p>")
+            else:
+                notes += f"<p class='src'><strong>{head}</p>"
             detail += ("<details><summary>Questions only in banks no quiz links to</summary>" + question_list(
                 f"{esc(short(variants[i].rep.text))} <span class='src'>&mdash; in "
                 f"{', '.join(bank_desc(k, False) for k in keys)}</span>"
@@ -2545,7 +2580,9 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                 for i, (group, keys) in cov.modified.items()) + "</details>")
         if cov.missing:
             detail += ("<details open><summary>In no bank</summary>" + question_list(
-                esc(short(variants[i].rep.text)) for i in cov.missing) + "</details>")
+                esc(short(variants[i].rep.text)) + (f" <span class='src'>({esc(type_label('Error'))})</span>"
+                                                    if variants[i].rep.question_type == "Error" else "")
+                for i in cov.missing) + "</details>")
         if cov.missing:
             tone = "warn"
         elif cov.modified or cov.in_unlinked:
@@ -2554,9 +2591,9 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
             tone = "plain"
         coverage_cards += f"""
             <div class="match-group {tone}" id="quiz-{n}"{filter_attrs("quiz-coverage", [c.title])}>
-              <h3>[{esc(kind_label(c.kind, c.engine))}] <strong>{esc(c.title)}</strong>{source(c)} &middot;
+              <h3>[{esc(kind_label(c.kind, c.engine))}] <strong>{esc(c.title)}</strong>{same_name}{source(c)} &middot;
                 {size}{unpublished}</h3>
-              <p class='src'>{line}</p>
+              {hint}<p class='src'>{line}</p>
               {notes}{detail}
             </div>
             """
