@@ -954,6 +954,37 @@ class ReviewFixes2(ExportCase):
         self.assertEqual(data["identical_quizzes_and_banks"], [])
 
 
+class ReviewFixes3(ExportCase):
+    """Fixes from the third outside review."""
+
+    def test_math_signs_keep_questions_apart(self):
+        pairs = [("x < 3", "x > 3"), ("x <= 3", "x < 3"), ("x = 3", "x 3"), ("1/2", "12"),
+                 ("a+b", "ab"), ("50%", "50"), ("2*3", "23"), ("5\u22123", "53"), ("x \u2260 3", "x = 3")]
+        for a, b in pairs:
+            self.assertNotEqual(qd.normalize(a), qd.normalize(b), (a, b))
+        self.assertEqual(qd.normalize("50%"), qd.normalize("50 percent"))
+        self.assertEqual(qd.normalize("1/2"), qd.normalize("1 / 2"))
+        self.assertEqual(qd.normalize("*Hint:"), qd.normalize("Hint"))
+
+    def test_mixed_draws_are_described(self):
+        c = qd.Container("e", "quiz", "q", "Quiz", draws=[("b1", None), ("b2", 5), ("b3", 2)])
+        self.assertEqual(qd.describe_contents(c), "uses all of 1 bank + draws 7 from 2 banks")
+
+    def test_items_of_a_nested_bank_belong_to_it_only(self):
+        inner = bank("gin", "Inner", [item(*OrphanBanks.Q3)]).split("?>", 1)[1]
+        inner = inner.replace(f'<questestinterop xmlns="{NS}">', "").replace("</questestinterop>", "")
+        outer = quiz("gq", "Outer", [item(*OrphanBanks.Q1)]).replace("</section></assessment>",
+                                                                   f"{inner}</section></assessment>")
+        questions, _, _, containers = qd.collect_questions([self.export({"non_cc_assessments/gq.xml.qti": outer})])
+        self.assertEqual(sorted((q.quiz_id, q.text) for q in questions),
+                         [("gin", OrphanBanks.Q3[1]), ("gq", OrphanBanks.Q1[1])])
+        self.assertEqual({c.cid: c.item_count for c in containers}, {"gq": 1, "gin": 1})
+
+    def test_empty_image_attributes_do_not_crash(self):
+        for tag in ('<img src="" alt="">', "<img src=''>", "<img>"):
+            self.assertEqual(qd.image_token(qd.IMG_RE.search(tag)), " [image: unnamed] ")
+
+
 class Images(ExportCase):
     IMG = '<img src="$IMS-CC-FILEBASE$/{}?canvas_download=1" alt="x"> What is wrong with this slide?'
 
