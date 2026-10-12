@@ -56,9 +56,8 @@ from xml.etree import ElementTree as ET
 import numpy as np
 from rapidfuzz import fuzz, process
 
-QTI_NS = "{http://www.imsglobal.org/xsd/ims_qtiasiv1p2}"
 
-TAG_RE = re.compile(r"<[^>]+>")
+TAG_RE = re.compile(r"<!--.*?-->|</?[A-Za-z][^<>]*>", re.S)  # a tag starts with a letter: "x < 3 and y > 5" is not one
 WS_RE = re.compile(r"\s+")
 
 
@@ -78,8 +77,9 @@ class ImageStore:
     "name (2)". The rest of the script compares the "[image: name]" text, so
     this alone makes identical pictures match and different pictures differ.
 
-    Images that can't be read (a web address, or a file the export leaves
-    out) keep their file name, as before."""
+    An image at a web address is named the same way, by its host and path
+    in place of its bytes. An image file the export leaves out keeps its
+    file name, as before."""
 
     def __init__(self):
         self.name_of = {}    # content hash -> name
@@ -118,18 +118,27 @@ class ImageStore:
                 rel = "web_resources/" + local[len(base):]
         if rel is None and local.lower().startswith("web_resources/"):
             rel = local
+        if rel is None and "://" in src:
+            # a web address is known by its host and path, so graph.png on two
+            # sites is two pictures. The query string is left out: Canvas adds
+            # per-link tokens (?verifier=...) to the same file.
+            self.by_address += 1
+            parts = urllib.parse.urlsplit(src)
+            path = re.sub(r"/(?:preview|download)$", "", parts.path)  # .../files/123/preview is file 123
+            return self.unique_name("url:" + parts.netloc.lower() + path, fallback)
         if rel is None:
-            if "://" in src:
-                self.by_address += 1
-            else:
-                self.by_name += 1
+            self.by_name += 1
             return fallback
         data = self.read(rel) if self.read else None
         if data is None:
             self.by_name += 1
             return fallback
         self.by_content += 1
-        digest = hashlib.sha256(data).hexdigest()
+        return self.unique_name(hashlib.sha256(data).hexdigest(), fallback)
+
+    def unique_name(self, digest, fallback):
+        """The name for the picture identified by `digest`: its file name, or
+        "name (2)" when a different picture already has that name."""
         if digest not in self.name_of:
             name, n = fallback, 1
             while name in self.hash_of:  # same file name, different picture
@@ -297,13 +306,23 @@ def local(tag):
 
 
 def extract_mattext(material_el):
-    """Get the plain-text content of a <material><mattext>...</mattext></material>."""
+    """Plain text of a <material>: every <mattext> in it, in order. HTML
+    mattext is stripped of its markup; text/plain mattext is taken as it is,
+    so a plain-text answer such as "x < 3 and y > 5" keeps its signs. Markup
+    written as XML elements inside a mattext (rather than escaped text) is
+    kept too, so text after a nested element is not lost."""
     if material_el is None:
         return ""
+    parts = []
     for child in material_el:
-        if local(child.tag) == "mattext":
-            return strip_html(child.text or "")
-    return ""
+        if local(child.tag) != "mattext":
+            continue
+        raw = (child.text or "") + "".join(ET.tostring(c, encoding="unicode") for c in child)
+        if (child.get("texttype") or "").lower() == "text/plain" and not len(child):
+            parts.append(WS_RE.sub(" ", raw).strip())
+        else:
+            parts.append(strip_html(raw))
+    return " ".join(p for p in parts if p)
 
 
 CONTAINER_TAGS = {"assessment", "objectbank"}
@@ -398,10 +417,13 @@ def bank_draws(container):
             if local(c.tag) == "sourcebank_ref":
                 bank_id = (c.text or "").strip()
             elif local(c.tag) == "selection_number":
-                try:
-                    count = int((c.text or "").strip())
-                except ValueError:
-                    pass
+                text = (c.text or "").strip()
+                if text:  # empty is how a New Quiz says "every question in the bank"
+                    try:
+                        count = int(text)
+                    except ValueError:
+                        print(f"  ! question group in \"{get_container_title(container)}\" has an unreadable "
+                              f"pick count ({text!r}); shown as all questions", file=sys.stderr)
         if bank_id:
             draws.append((bank_id, count))
     return draws
@@ -453,118 +475,117 @@ def parse_quiz_xml(path, source_file):
                                     bank_draws(assessment), bank_picks(assessment)))
 
         for item in own_items(assessment):
-            if True:
-                item_id = item.get("ident", "")
-                item_title = item.get("title", "")
+            item_id = item.get("ident", "")
+            item_title = item.get("title", "")
 
-                # question_type from itemmetadata
-                qtype = "unknown"
-                points = ""
-                bank_ref = ""
-                for qmf in item.iter():
-                    if local(qmf.tag) == "qtimetadatafield":
-                        label_el = None
-                        entry_el = None
-                        for c in qmf:
-                            if local(c.tag) == "fieldlabel":
-                                label_el = c
-                            elif local(c.tag) == "fieldentry":
-                                entry_el = c
-                        if label_el is not None and entry_el is not None:
-                            if label_el.text == "question_type":
-                                qtype = entry_el.text or "unknown"
-                            elif label_el.text == "points_possible":
-                                points = entry_el.text or ""
-                            elif label_el.text == "assessment_question_identifierref":
-                                bank_ref = (entry_el.text or "").strip()
+            # question_type from itemmetadata
+            qtype = "unknown"
+            points = ""
+            bank_ref = ""
+            for qmf in item.iter():
+                if local(qmf.tag) == "qtimetadatafield":
+                    label_el = None
+                    entry_el = None
+                    for c in qmf:
+                        if local(c.tag) == "fieldlabel":
+                            label_el = c
+                        elif local(c.tag) == "fieldentry":
+                            entry_el = c
+                    if label_el is not None and entry_el is not None:
+                        if label_el.text == "question_type":
+                            qtype = entry_el.text or "unknown"
+                        elif label_el.text == "points_possible":
+                            points = entry_el.text or ""
+                        elif label_el.text == "assessment_question_identifierref":
+                            bank_ref = (entry_el.text or "").strip()
 
-                # question stem: first <presentation><material><mattext>
-                stem_text = ""
-                presentation = None
-                for c in item:
-                    if local(c.tag) == "presentation":
-                        presentation = c
-                        break
-                if presentation is not None:
-                    for c in presentation:
-                        if local(c.tag) == "material":
-                            stem_text = extract_mattext(c)
-                            break
+            # question stem: first <presentation><material><mattext>
+            stem_text = ""
+            presentation = None
+            for c in item:
+                if local(c.tag) == "presentation":
+                    presentation = c
+                    break
+            if presentation is not None:
+                # the stem is the <material> blocks directly under <presentation>;
+                # choices sit inside the response elements and are read below
+                stem_text = " ".join(t for t in (extract_mattext(c) for c in presentation
+                                                 if local(c.tag) == "material") if t)
 
-                if not stem_text:
-                    stem_text = WS_RE.sub(" ", item_title).strip()  # plain text, not HTML
+            if not stem_text:
+                stem_text = WS_RE.sub(" ", item_title).strip()  # plain text, not HTML
 
-                # answer choices (choice-based question types)
-                choices = []
-                prompts = []     # left-hand side of a matching question
-                label_text = {}  # response_label ident -> choice text
-                label_idents = set()
-                lid_text = {}    # response_lid ident -> its own prompt (matching rows, dropdown blanks)
-                if presentation is not None:
-                    for resp in presentation.iter():
-                        rtag = local(resp.tag)
-                        if rtag == "response_lid":
-                            for c in resp:
-                                if local(c.tag) == "material":
-                                    ltext = extract_mattext(c)
-                                    if ltext:
-                                        lid_text[resp.get("ident", "")] = ltext
-                                        # the left-hand side of a matching question is
-                                        # part of what can be reworded, so compare it too
-                                        if qtype == "matching_question":
-                                            prompts.append(ltext)
-                        elif rtag == "response_label":
-                            label_idents.add(resp.get("ident", ""))
-                            for c in resp:
-                                if local(c.tag) == "material":
-                                    ctext = extract_mattext(c)
-                                    if ctext:
-                                        label_text[resp.get("ident", "")] = ctext
-                                        # matching repeats the right-hand options under
-                                        # every row; keep one copy
-                                        if qtype != "matching_question" or ctext not in choices:
-                                            choices.append(ctext)
+            # answer choices (choice-based question types)
+            choices = []
+            prompts = []     # left-hand side of a matching question
+            label_text = {}  # response_label ident -> choice text
+            label_idents = set()
+            lid_text = {}    # response_lid ident -> its own prompt (matching rows, dropdown blanks)
+            if presentation is not None:
+                for resp in presentation.iter():
+                    rtag = local(resp.tag)
+                    if rtag == "response_lid":
+                        for c in resp:
+                            if local(c.tag) == "material":
+                                ltext = extract_mattext(c)
+                                if ltext:
+                                    lid_text[resp.get("ident", "")] = ltext
+                                    # the left-hand side of a matching question is
+                                    # part of what can be reworded, so compare it too
+                                    if qtype == "matching_question":
+                                        prompts.append(ltext)
+                    elif rtag == "response_label":
+                        label_idents.add(resp.get("ident", ""))
+                        for c in resp:
+                            if local(c.tag) == "material":
+                                ctext = extract_mattext(c)
+                                if ctext:
+                                    label_text[resp.get("ident", "")] = ctext
+                                    # matching repeats the right-hand options under
+                                    # every row; keep one copy
+                                    if qtype != "matching_question" or ctext not in choices:
+                                        choices.append(ctext)
 
-                choices = prompts + choices  # matching: all prompts, then the options
+            choices = prompts + choices  # matching: all prompts, then the options
 
-                # answer key
-                correct = []
-                key_pairs = []
-                blank_types = ("multiple_dropdowns_question", "fill_in_multiple_blanks_question")
-                for respident, value in credited_answers(item):
-                    if value in label_idents and value not in label_text:
-                        continue  # points at a choice with no readable text
-                    # short-answer keys carry the answer text itself, not an id
-                    # and it is plain text: "x < 3 and y > 5" must not lose "< 3 and y >" as a tag
-                    answer = label_text.get(value, WS_RE.sub(" ", value).strip())
-                    prompt = lid_text.get(respident)
-                    if not prompt and qtype in blank_types and respident.startswith("response_"):
-                        prompt = respident[len("response_"):]
-                    entry = f"{prompt} \u2192 {answer}" if prompt else answer
-                    if entry and entry not in correct:
-                        correct.append(entry)
-                        if prompt:
-                            key_pairs.append((prompt, answer))
+            # answer key
+            correct = []
+            key_pairs = []
+            blank_types = ("multiple_dropdowns_question", "fill_in_multiple_blanks_question")
+            for respident, value in credited_answers(item):
+                if value in label_idents and value not in label_text:
+                    continue  # points at a choice with no readable text
+                # short-answer keys carry the answer text itself, not an id
+                # and it is plain text: "x < 3 and y > 5" must not lose "< 3 and y >" as a tag
+                answer = label_text.get(value, WS_RE.sub(" ", value).strip())
+                prompt = lid_text.get(respident)
+                if not prompt and qtype in blank_types and respident.startswith("response_"):
+                    prompt = respident[len("response_"):]
+                entry = f"{prompt} \u2192 {answer}" if prompt else answer
+                if entry and entry not in correct:
+                    correct.append(entry)
+                    if prompt:
+                        key_pairs.append((prompt, answer))
 
-                if not stem_text:
-                    stem_text = "[no question text]"
+            if not stem_text:
+                stem_text = "[no question text]"
 
-                containers[-1].item_count += 1
-                questions.append(Question(
-                    source_file=source_file,
-                    quiz_title=quiz_title,
-                    quiz_id=quiz_id,
-                    item_id=item_id,
-                    question_type=qtype,
-                    points=points,
-                    text=stem_text,
-                    choices=choices,
-                    source_kind=source_kind,
-                    correct=correct,
-                    key_pairs=key_pairs,
-                    engine=engine,
-                    bank_ref=bank_ref if source_kind == "quiz" else "",
-                ))
+            containers[-1].item_count += 1
+            questions.append(Question(
+                source_file=source_file,
+                quiz_title=quiz_title,
+                quiz_id=quiz_id,
+                item_id=item_id,
+                question_type=qtype,
+                points=points,
+                text=stem_text,
+                choices=choices,
+                source_kind=source_kind,
+                correct=correct,
+                key_pairs=key_pairs,
+                engine=engine,
+                bank_ref=bank_ref if source_kind == "quiz" else "",
+            ))
 
     return questions, containers
 
@@ -581,9 +602,9 @@ def find_quiz_xml_files(root_dir):
     results = []
     for dirpath, dirnames, filenames in os.walk(root_dir):
         for fn in filenames:
-            if fn in ("assessment_meta.xml", "imsmanifest.xml"):
+            if fn.lower() in ("assessment_meta.xml", "imsmanifest.xml"):
                 continue
-            if not (fn.endswith(".xml") or fn.endswith(".qti")):
+            if not fn.lower().endswith((".xml", ".qti")):
                 continue
             full = os.path.join(dirpath, fn)
             try:
@@ -631,10 +652,11 @@ def read_published(root_dir):
     with no such file (New Quizzes, quiz-only exports) are left out."""
     found = {}
     for dirpath, _, filenames in os.walk(root_dir):
-        if "assessment_meta.xml" not in filenames:
+        meta = next((fn for fn in filenames if fn.lower() == "assessment_meta.xml"), None)
+        if meta is None:
             continue
         try:
-            root = ET.parse(os.path.join(dirpath, "assessment_meta.xml")).getroot()
+            root = ET.parse(os.path.join(dirpath, meta)).getroot()
         except ET.ParseError:
             continue
         ident = root.get("identifier", "")
@@ -2417,7 +2439,8 @@ def main():
     ap.add_argument("-t", "--threshold", type=float, default=85.0,
                     help="How similar the stem or the choices must be to call two questions "
                          "versions of each other, 0-100 (default 85). Lower finds heavier "
-                         "rewrites but more false matches; below about 60 expect mostly noise.")
+                         "rewrites but more false matches; below about 60 expect mostly noise. "
+                         "Stem scores are whole numbers.")
     ap.add_argument("--word-overlap", type=float, default=WORD_OVERLAP,
                     help="When two stems are worded differently, how much of their distinctive "
                          "wording they must share to be the same question, 0-100 (default "
@@ -2444,8 +2467,8 @@ def main():
         "The fixed rules behind --threshold. The defaults were tuned on real course exports; "
         "see 'How matching works' in the README before changing them.")
     for name, default, text in ADVANCED_SETTINGS:
-        tuning.add_argument(f"--{name.lower().replace('_', '-')}", type=float, default=default, metavar="N",
-                            help=f"{text} (default {default:g})")
+        tuning.add_argument(f"--{name.lower().replace('_', '-')}", type=int if name == "MIN_CONTAINER" else float,
+                            default=default, metavar="N", help=f"{text} (default {default:g})")
     args = ap.parse_args()
     for name in ("threshold", "word_overlap", "container_overlap") + tuple(
             n.lower() for n, _, _ in ADVANCED_SETTINGS if n != "MIN_CONTAINER"):
@@ -2456,7 +2479,7 @@ def main():
     # the matching functions read these module settings when they run
     for name, _, _ in ADVANCED_SETTINGS:
         value = getattr(args, name.lower())
-        globals()[name] = int(value) if name == "MIN_CONTAINER" else value
+        globals()[name] = value
 
     print("Parsing exports...")
     images = ImageStore()
