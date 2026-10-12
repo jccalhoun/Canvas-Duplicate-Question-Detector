@@ -2026,7 +2026,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
             head += f" {plural(total, 'question')} in total."
             extra = unique_list(banks)
         elif v == VERDICT_COPY:
-            examples = sorted(banks, key=lambda b: (-len(b.kept_for), b.bank.title.lower()))[:3]
+            examples = sorted(banks, key=lambda b: (-len(b.kept_for), b.bank.title.lower()))[:8]
             extra = "<ul>" + "".join(
                 f"<li>Keep {bank_link(b)}. {plural(len(b.kept_for), 'bank relies', 'banks rely')} on it for "
                 f"questions found nowhere else in use: {bank_links(b.kept_for, 4)}.</li>"
