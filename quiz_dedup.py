@@ -1981,20 +1981,28 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
         (chapter_1..., chapter_2...) folded together."""
         number = r"(?<![A-Za-z])(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|" \
                  r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)(?![A-Za-z])"
+        def pattern(title):
+            """'chapter_N-…' for 'chapter_4-_language': the words before the first
+            number, the number as N, and the punctuation after it. None when no
+            word comes first, so '101 final' and '2018 summer' are not a family."""
+            m = re.search(number, title, re.I)
+            if not m or len(re.findall(r"[A-Za-z]", title[:m.start()])) < 3:
+                return None
+            after = re.match(r"[^A-Za-z0-9]*", title[m.end():]).group(0)
+            return title[:m.start()] + "N" + after.rstrip()
+
         families = {}
         for b in banks:
-            m = re.search(number, b.bank.title, re.I)
-            key = (b.bank.title[:m.start()].strip().lower() + " N") if m else None
-            families.setdefault(key or id(b), []).append(b)
+            key = pattern(b.bank.title)
+            families.setdefault(key.lower() if key else id(b), []).append(b)
         entries = []
         for key, group in families.items():
             counts = sorted(b.count("unique") for b in group)
             if isinstance(key, str) and len(group) >= 3:
-                stem = group[0].bank.title[:re.search(number, group[0].bank.title, re.I).start()]
                 each = (f"{counts[0]} each" if counts[0] == counts[-1] else f"{counts[0]}\u2013{counts[-1]} each")
                 all_unique = all(b.count("unique") == b.bank.size for b in group)
-                entries.append((sum(counts), f"the {len(group)} \u201c{esc(stem.strip())} \u2026\u201d banks: "
-                                              f"{each}{', all unique' if all_unique else ''}"))
+                entries.append((sum(counts), f"the {len(group)} \u201c{esc(pattern(group[0].bank.title))}\u2026\u201d "
+                                              f"banks: {each}{', all unique' if all_unique else ''}"))
             else:
                 for b in group:
                     entries.append((b.count("unique"), f"{bank_link(b)}: {b.count('unique')}"
@@ -2020,8 +2028,9 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
         elif v == VERDICT_COPY:
             examples = sorted(banks, key=lambda b: (-len(b.kept_for), b.bank.title.lower()))[:3]
             extra = "<ul>" + "".join(
-                f"<li>Keep {bank_link(b)}; it holds the questions that are otherwise only in "
-                f"{bank_links(b.kept_for, 4)}.</li>" for b in examples if b.kept_for) + "</ul>"
+                f"<li>Keep {bank_link(b)}. {plural(len(b.kept_for), 'bank relies', 'banks rely')} on it for "
+                f"questions found nowhere else in use: {bank_links(b.kept_for, 4)}.</li>"
+                for b in examples if b.kept_for) + "</ul>"
         elif v in (VERDICT_SAFE, VERDICT_COVERED, VERDICT_REVIEW):
             extra = f"<p class='src'>{bank_links(banks, 6)}</p>"
         summary_items += f"<li>{head}{extra}</li>"

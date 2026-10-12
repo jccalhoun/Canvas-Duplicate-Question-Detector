@@ -778,8 +778,29 @@ class OrphanBanks(ExportCase):
         summary = summary[:summary.index("</ul>\n")]
         self.assertIn("Has unique questions", summary)
         self.assertIn(qd.VERDICT_HELP[qd.VERDICT_UNIQUE], summary)
-        self.assertIn("the 3 \u201cchapter_ \u2026\u201d banks: 1 each, all unique", summary)
+        self.assertIn("the 3 \u201cchapter_N-_\u2026\u201d banks: 1 each, all unique", summary)
         self.assertIn("\u201cLone bank\u201d</a>: 1 (all unique)", summary)
+
+    def test_families_need_a_word_first_and_the_same_punctuation(self):
+        qs = [self.Q1, self.Q3, self.Q4, self.Q5, self.Q2,
+              (MC, "Which outline lists only key words?", ["Speaking outline", "Formal outline", "Rough outline"],
+               ["Speaking outline"])]
+        titles = ["101 final", "2018 summer final", "2019 midterm",              # no word first: not a family
+                  "Chapter_01_First_Look", "Chapter_04_Words", "chapter_4-_language"]  # two styles: no family of 3
+        files = {f"non_cc_assessments/gt{k}.xml.qti": bank(f"gt{k}", t, [item(*q)])
+                 for k, (t, q) in enumerate(zip(titles, qs))}
+        path = self.export(files)
+        out = os.path.join(self.dir, "report.html")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with open(out, encoding="utf-8") as f:
+            report = f.read()
+        summary = report[report.index("class='audit-summary'"):]
+        summary = summary[:summary.index("</ul>\n")]
+        self.assertNotIn("\u2026\u201d banks", summary)
+        for t in titles:
+            self.assertIn(f"\u201c{t}\u201d</a>: 1", summary)
 
     def test_report_links_review_items_to_their_modified_group(self):
         report, data = self.run_main()
