@@ -91,6 +91,7 @@ What counts as an item:
 | Section | An item | The titles it matches on |
 |---|---|---|
 | Bank table | one bank | the bank's title |
+| Quiz coverage | one quiz | the quiz's title |
 | Bank verdict lists | one bank | the bank's title |
 | Quizzes that use questions from banks | one quiz | the quiz and the banks it draws from |
 | Identical, mostly contained | one group | every quiz and bank in the group |
@@ -112,6 +113,7 @@ The JSON file holds the same findings as the HTML report, in the same order, for
 | --- | --- |
 | `generated`, `settings`, `summary`, `question_images` | Run date, the options used, overall counts, and how question images were compared |
 | `bank_usage_audit`, `classic_bank_links` | Each bank's usage status, orphan verdict, how many of its questions are also stored elsewhere (`also_stored_elsewhere`), the kept banks it relies on or is kept for, and how many quiz questions point back to a bank question |
+| `quiz_coverage` | For each quiz with questions of its own: how many are in a linked bank, only in banks no quiz links to, only modified in a bank, or in no bank, and the questions in the last three groups |
 | `quizzes_and_banks` | Every quiz and bank, with what each quiz draws or uses from banks |
 | `identical_quizzes_and_banks`, `mostly_contained`, `quizzes_with_nothing_in_export` | The whole-quiz and whole-bank findings |
 | `modified_questions`, `similar_wording_different_answer` | Clusters of versions |
@@ -163,6 +165,20 @@ The section opens with a summary of each verdict and the banks in it. Banks with
 Each review item links to its group in *Modified questions*, where the word-level diff shows what changed.
 
 The statuses can be checked against the Unused Classic Quiz Bank Checker: its *Used?* column should read `LINKED`, `COPIED ONLY` or `no` for the same banks. Match banks by title and question count, since the export does not carry Canvas's bank ids.
+
+## Quiz coverage
+
+The second section answers a question for every quiz that stores questions of its own: if this quiz were retired, would anything be lost? Each distinct question in the quiz is put in one of these:
+
+| Found | Meaning |
+|---|---|
+| in a bank as is | the same question is in a bank |
+| only as a modified version | no bank has it unchanged, but a version from the same *Modified questions* group is in a bank. Each one links to its group so you can compare the wording |
+| in no bank | neither the question nor any version of it is in a bank |
+
+A question counted as *in a bank as is* can still be at risk. When every bank holding it is one no quiz links to, the card says so and names those banks. The bank check counts a quiz's own questions as in use, so it can mark such a bank *Safe to delete* because the quiz holds copies. The quiz and the bank then vouch for each other. Deleting both loses the questions. The card shows how many of these questions each bank holds and how many are in no other bank.
+
+The heading of each card gives the question count. Distinct questions are shown too when the quiz repeats a question. Quizzes that only draw questions from banks are not listed, since their questions already live in the banks. Questions removed with `--exclude-type` are not counted. Cards are sorted by title and work with the title filter, so typing part of a quiz's name brings up its card.
 
 ## Duplicate quizzes and banks
 

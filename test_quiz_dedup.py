@@ -1390,6 +1390,77 @@ class TitleFilter(ExportCase):
             self.assertTrue(note.endswith(" hidden>"), note)
 
 
+class QuizCoverageCheck(ExportCase):
+    """Quiz coverage: whether each of a quiz's own questions is also in a
+    bank as is, only as a modified version, or nowhere in a bank. Uses the
+    OrphanBanks course, where bank ga is linked and the rest are not."""
+    Q1, Q2, Q2_TWEAKED, Q3, Q4, Q5 = (OrphanBanks.Q1, OrphanBanks.Q2, OrphanBanks.Q2_TWEAKED,
+                                      OrphanBanks.Q3, OrphanBanks.Q4, OrphanBanks.Q5)
+    Q5_REWORDED = (MC, "A fallacy that attacks the person rather than the argument is called what?",
+                   OrphanBanks.Q5[2], OrphanBanks.Q5[3])
+    Q6 = (MC, "Which listening style focuses on the speaker's feelings?",
+          ["People-oriented", "Action-oriented", "Content-oriented", "Time-oriented"], ["People-oriented"])
+
+    def course(self):
+        files = OrphanBanks.course(self)
+        files["non_cc_assessments/gq9.xml.qti"] = quiz("gq9", "Old pool", [
+            item(*self.Q1), item(*self.Q1), item(*self.Q3), item(*self.Q5_REWORDED), item(*self.Q6)])
+        return files
+
+    def report(self):
+        path = self.export(self.course())
+        out, target = os.path.join(self.dir, "report.html"), os.path.join(self.dir, "report.json")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out, "--json", target]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with open(out, encoding="utf-8") as f, open(target, encoding="utf-8") as g:
+            return f.read(), json.load(g)
+
+    def test_each_question_lands_in_one_list(self):
+        path = self.export(self.course())
+        questions, _, _, containers = qd.collect_questions([path])
+        usage, _, _ = qd.find_bank_usage(questions, containers)
+        variants = qd.build_variants(questions)
+        clusters, roots, _ = qd.find_version_clusters(variants, 85.0)
+        qd.find_duplicate_containers(variants, roots, containers=containers)
+        audit = qd.check_orphan_banks(variants, roots, containers, usage)
+        cluster_of = {id(v): n for n, group in enumerate(clusters, 1) for v in group}
+        cov = {c.quiz.cid: c for c in qd.quiz_coverage(variants, containers, cluster_of, audit)}
+        self.assertNotIn("gq1", cov)  # draws from a bank, stores nothing of its own
+        old = cov["gq9"]
+        stem = lambda i: variants[i].rep.text
+        self.assertEqual(old.distinct, 4)
+        self.assertEqual([stem(i) for i in old.in_linked], [self.Q1[1]])  # Q1 is in linked bank ga
+        self.assertEqual({stem(i): [k[1] for k in keys] for i, keys in old.in_unlinked.items()},
+                         {self.Q3[1]: ["gd", "ge"]})
+        ((group, keys),) = old.modified.values()
+        self.assertEqual(([k[1] for k in keys], stem(next(iter(old.modified)))), (["gf"], self.Q5_REWORDED[1]))
+        self.assertIn(group, cluster_of.values())
+        self.assertEqual([stem(i) for i in old.missing], [self.Q6[1]])
+        # the Fallacies quiz copy of Q5 is only in Extra, which no quiz links to
+        self.assertEqual(len(cov["gq2"].in_unlinked), 1)
+
+    def test_report_section_and_json(self):
+        report, data = self.report()
+        self.assertIn('id="quiz-coverage"', report)
+        self.assertIn("href='#quiz-coverage'", report)
+        card = report[report.index("<strong>Old pool</strong>"):]
+        card = card[:card.index("</div>")]
+        self.assertIn("5 questions, 4 distinct", card)
+        self.assertIn("2 of 4 in a bank as is; 1 only as a modified version; 1 in no bank.", card)
+        self.assertIn("1 question is only in banks no quiz links to", card)
+        self.assertIn("Old final <span class='src'>#", card)  # same-named banks are told apart
+        self.assertIn(html.escape(self.Q6[1]), card)
+        self.assertIn("href='#modified-", card)
+        old = next(q for q in data["quiz_coverage"] if q["title"] == "Old pool")
+        self.assertEqual((old["in_a_linked_bank"], old["only_in_banks_no_quiz_links_to"],
+                          old["only_modified_in_a_bank"], old["in_no_bank"]), (1, 1, 1, 1))
+        self.assertEqual(sorted(q["coverage"] for q in old["questions_to_review"]),
+                         ["modified", "none", "only_in_unlinked_banks"])
+        self.assertIn(["old pool"], [titles for _, section, titles in TitleFilter.blocks(None, report)
+                                     if section == "quiz-coverage"])
+
+
 class Scoring(unittest.TestCase):
     def test_numbers_keep_their_sign_and_shape(self):
         forms = ["5", "-5", ".5", "1.5", "15", "1-5", "\u22125"]
