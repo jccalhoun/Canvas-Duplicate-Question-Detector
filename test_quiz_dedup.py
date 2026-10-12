@@ -21,7 +21,7 @@ MC = "multiple_choice_question"
 _n = [1000]
 
 
-def item(qtype, stem, choices=None, correct=(), answers=None, rows=None, new=False):
+def item(qtype, stem, choices=None, correct=(), answers=None, rows=None, new=False, bank_ref=None):
     """One <item>. choices/correct for choice questions, answers for short
     answer, rows=[(prompt, answer)] for matching. new=True writes it the way
     a New Quizzes question is exported: uuid answer ids, choices wrapped in
@@ -59,6 +59,10 @@ def item(qtype, stem, choices=None, correct=(), answers=None, rows=None, new=Fal
     ident = f"{_n[0]:032x}" if new else f"g{_n[0]}"
     calculator = ('<qtimetadatafield><fieldlabel>calculator_type</fieldlabel><fieldentry>none</fieldentry>'
                   '</qtimetadatafield>') if new else ""
+    if bank_ref:
+        # how a Classic quiz question copied from a bank points back at the bank question
+        calculator += ('<qtimetadatafield><fieldlabel>assessment_question_identifierref</fieldlabel>'
+                       f'<fieldentry>{bank_ref}</fieldentry></qtimetadatafield>')
     return (f'<item ident="{ident}" title="Question"><itemmetadata><qtimetadata>'
             f'<qtimetadatafield><fieldlabel>question_type</fieldlabel><fieldentry>{qtype}</fieldentry></qtimetadatafield>'
             f'<qtimetadatafield><fieldlabel>points_possible</fieldlabel><fieldentry>1.0</fieldentry></qtimetadatafield>'
@@ -631,6 +635,110 @@ class Outputs(ExportCase):
         self.assertIn("unresolved", links)
         for anchor in links:
             self.assertEqual(report.count(f'id="{anchor}"'), 1, anchor)
+
+
+class OrphanBanks(ExportCase):
+    """The bank usage and orphan check: which banks quizzes use, and for the
+    rest, whether every question also lives somewhere in use."""
+    Q1 = (MC, "What is the specific purpose of a speech?",
+          ["The goal in one sentence", "The topic area", "The audience", "The thesis outline"],
+          ["The goal in one sentence"])
+    Q2 = (MC, STEM, CHOICES, [CHOICES[0]])
+    Q2_TWEAKED = (MC, STEM, CHOICES[:3] + ["The use of time to send messages"], [CHOICES[0]])
+    Q3 = (MC, "Which appeal relies on the credibility of the speaker?",
+          ["Ethos", "Pathos", "Logos", "Kairos"], ["Ethos"])
+    Q4 = (MC, "Monroe's motivated sequence begins with which step?",
+          ["Attention", "Need", "Satisfaction", "Action"], ["Attention"])
+    Q5 = (MC, "A fallacy that attacks the person instead of the argument is called what?",
+          ["Ad hominem", "Straw man", "Slippery slope", "Bandwagon"], ["Ad hominem"])
+
+    def course(self):
+        q5 = item(*self.Q5)
+        return {
+            "non_cc_assessments/ga.xml.qti": bank("ga", "Persuasion", [item(*self.Q1), item(*self.Q2)]),
+            "non_cc_assessments/gb.xml.qti": bank("gb", "Persuasion", [item(*self.Q1), item(*self.Q2)]),
+            "non_cc_assessments/gc.xml.qti": bank("gc", "Persuasion", [item(*self.Q1), item(*self.Q2_TWEAKED)]),
+            "non_cc_assessments/gd.xml.qti": bank("gd", "Old final", [item(*self.Q3)]),
+            "non_cc_assessments/ge.xml.qti": bank("ge", "Old final", [item(*self.Q3)]),
+            "non_cc_assessments/gf.xml.qti": bank("gf", "Extra", [item(*self.Q4), q5]),
+            "non_cc_assessments/gg.xml.qti": bank("gg", "Empty", []),
+            "non_cc_assessments/gq1.xml.qti": quiz("gq1", "Unit 3 quiz", [], bank_refs=["ga"]),
+            "non_cc_assessments/gq2.xml.qti": quiz("gq2", "Fallacies quiz", [item(*self.Q5, bank_ref=item_id(q5))]),
+        }
+
+    def check(self, files=None):
+        path = self.export(files or self.course())
+        questions, _, _, containers = qd.collect_questions([path])
+        usage, seen, resolved = qd.find_bank_usage(questions, containers)
+        variants = qd.build_variants(questions)
+        _, roots, _ = qd.find_version_clusters(variants, 85.0)
+        qd.find_duplicate_containers(variants, roots, containers=containers)
+        return {b.bank.cid: b for b in qd.check_orphan_banks(variants, roots, containers, usage)}, seen, resolved
+
+    def test_usage_status(self):
+        audit, seen, resolved = self.check()
+        self.assertEqual((seen, resolved), (1, 1))
+        self.assertEqual({k: b.status for k, b in audit.items()},
+                         {"ga": "linked", "gb": "unused", "gc": "unused", "gd": "unused", "ge": "unused",
+                          "gf": "copied only", "gg": "unused"})
+        self.assertEqual(audit["ga"].usage.linked_by, {"Unit 3 quiz"})
+        self.assertEqual(audit["gf"].usage.copied_into, {"Fallacies quiz"})
+        self.assertEqual(audit["ga"].verdict, "")  # linked banks get no verdict
+
+    def test_verdicts(self):
+        audit, _, _ = self.check()
+        self.assertEqual({k: b.verdict for k, b in audit.items() if b.verdict},
+                         {"gb": "safe", "gc": "review", "gd": "keep", "ge": "keep", "gf": "keep", "gg": "empty"})
+        self.assertEqual(audit["gc"].count("modified"), 1)
+        modified = next(f for f in audit["gc"].findings if f.coverage == "modified")
+        self.assertEqual(modified.places, ["Persuasion"])
+        # Q4 is unique; Q5 was copied into a quiz, so it is in use as is
+        self.assertEqual((audit["gf"].count("unique"), audit["gf"].count("exact")), (1, 1))
+
+    def test_unlinked_copies_do_not_vouch_for_each_other(self):
+        audit, _, _ = self.check()
+        for cid in ("gd", "ge"):
+            (finding,) = audit[cid].findings
+            self.assertEqual((finding.coverage, finding.places), ("unused_only", ["Old final"]))
+
+    def test_unresolved_back_pointer_is_counted_but_not_used(self):
+        files = self.course()
+        files["non_cc_assessments/gq3.xml.qti"] = quiz("gq3", "Inline quiz", [item(*self.Q4, bank_ref="gnothere")])
+        audit, seen, resolved = self.check(files)
+        self.assertEqual((seen, resolved), (2, 1))
+        # Q4 now has an in-use copy in a quiz, so the Extra bank is safe to delete
+        self.assertEqual((audit["gf"].status, audit["gf"].verdict), ("copied only", "safe"))
+
+    def run_main(self, *extra):
+        path = self.export(self.course())
+        out, target = os.path.join(self.dir, "report.html"), os.path.join(self.dir, "report.json")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out, "--json", target, *extra]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with open(out, encoding="utf-8") as f, open(target, encoding="utf-8") as g:
+            return f.read(), json.load(g)
+
+    def test_excluded_quiz_still_counts_as_using_its_bank(self):
+        _, data = self.run_main("--exclude-title", "Unit 3")
+        rows = {b["id"]: b for b in data["bank_usage_audit"]}
+        self.assertEqual(rows["ga"]["status"], "linked")
+        self.assertEqual(rows["ga"]["linked_by"], ["Unit 3 quiz"])
+
+    def test_excluded_type_blocks_safe(self):
+        _, data = self.run_main("--exclude-type", MC)
+        rows = {b["id"]: b for b in data["bank_usage_audit"]}
+        self.assertEqual((rows["gb"]["verdict"], rows["gb"]["counts"]["not_compared"]), ("review", 2))
+
+    def test_report_links_review_items_to_their_modified_group(self):
+        report, data = self.run_main()
+        rows = {b["id"]: b for b in data["bank_usage_audit"]}
+        (item_,) = rows["gc"]["questions_to_review"]
+        group = item_["modified_group"]
+        self.assertEqual(item_["coverage"], "modified")
+        self.assertIn(f"href='#modified-{group}'", report)
+        self.assertEqual(report.count(f'id="modified-{group}"'), 1)
+        self.assertEqual(data["classic_bank_links"], {"quiz_questions_pointing_to_a_bank_question": 1,
+                                                      "found_in_export": 1})
 
 
 class Images(ExportCase):
