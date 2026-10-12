@@ -14,6 +14,8 @@ import unittest
 import zipfile
 from unittest import mock
 
+import xml.etree.ElementTree as ET
+
 import quiz_dedup as qd
 
 NS = "http://www.imsglobal.org/xsd/ims_qtiasiv1p2"
@@ -983,6 +985,78 @@ class ReviewFixes3(ExportCase):
     def test_empty_image_attributes_do_not_crash(self):
         for tag in ('<img src="" alt="">', "<img src=''>", "<img>"):
             self.assertEqual(qd.image_token(qd.IMG_RE.search(tag)), " [image: unnamed] ")
+
+
+class ReviewFixes4(ExportCase):
+    """Fixes from the fourth outside review."""
+
+    def test_plain_text_signs_are_not_taken_for_tags(self):
+        mat = lambda xml: ET.fromstring(xml)
+        self.assertEqual(qd.extract_mattext(mat('<material><mattext texttype="text/plain">'
+                                                 'x &lt; 3 and y &gt; 5</mattext></material>')), "x < 3 and y > 5")
+        self.assertEqual(qd.strip_html("Is x < 3 and y > 5?"), "Is x < 3 and y > 5?")
+        self.assertEqual(qd.strip_html("<p>Is x &lt; 3 <strong>or</strong> x &gt;= 9?</p><!-- c -->"),
+                         "Is x < 3 or x >= 9?")
+
+    def test_plain_text_choices_keep_their_signs_through_parsing(self):
+        xml = item(MC, "Which is true?", ["A", "B"], ["A"]).replace(
+            '<mattext texttype="text/html">A</mattext>', '<mattext texttype="text/plain">x &lt; 3 and y &gt; 5</mattext>')
+        (q,), _, _, _ = qd.collect_questions([self.export({"non_cc_assessments/gb.xml.qti": bank("gb", "B", [xml])})])
+        self.assertIn("x < 3 and y > 5", q.choices)
+        self.assertIn("x < 3 and y > 5", q.correct)
+
+    def test_plain_text_entities_are_decoded(self):
+        # a real export had one copy of a choice as text/plain with a trailing &nbsp;
+        plain = item(MC, "Which is true?", ["Alpha one", "Beta two"], ["Alpha one"]).replace(
+            '<mattext texttype="text/html">Beta two</mattext>',
+            '<mattext texttype="text/plain">Beta two&amp;nbsp;</mattext>')
+        html_copy = item(MC, "Which is true?", ["Alpha one", "Beta two"], ["Alpha one"])
+        questions, _, _, _ = qd.collect_questions([self.export(
+            {"non_cc_assessments/gb.xml.qti": bank("gb", "B", [plain, html_copy])})])
+        self.assertEqual(questions[0].choices, ["Alpha one", "Beta two"])
+        self.assertEqual(len(qd.build_variants(questions)), 1)
+
+    def test_every_stem_block_and_nested_text_is_read(self):
+        xml = item(MC, "First paragraph.", ["A one", "B two"], ["A one"]).replace(
+            "<presentation>", "<presentation><material><mattext>Read <b>this</b> case.</mattext></material>", 1)
+        (q,), _, _, _ = qd.collect_questions([self.export({"non_cc_assessments/gb.xml.qti": bank("gb", "B", [xml])})])
+        self.assertEqual(q.text, "Read this case. First paragraph.")
+        self.assertEqual(q.choices, ["A one", "B two"])
+
+    def test_uppercase_extensions_are_found(self):
+        os.makedirs(os.path.join(self.dir, "x"))
+        with open(os.path.join(self.dir, "x", "BANK.QTI"), "w", encoding="utf-8") as f:
+            f.write(bank("gb", "B", [item(*OrphanBanks.Q1)]))
+        with open(os.path.join(self.dir, "x", "ASSESSMENT_META.XML"), "w", encoding="utf-8") as f:
+            f.write("<quiz/>")
+        self.assertEqual([os.path.basename(p) for p in qd.find_quiz_xml_files(os.path.join(self.dir, "x"))],
+                         ["BANK.QTI"])
+
+    def test_web_images_are_told_apart_by_site_and_path(self):
+        qd.IMAGES = qd.ImageStore()
+        try:
+            name = lambda src: qd.image_token(qd.IMG_RE.search(f'<img src="{src}">'))
+            a = name("https://example-a.org/assets/graph.png")
+            self.assertNotEqual(a, name("https://example-b.org/charts/graph.png"))
+            self.assertEqual(a, name("https://EXAMPLE-A.org/assets/graph.png?verifier=xyz"))
+            self.assertEqual(name("https://x.instructure.com/courses/1/files/456/preview?verifier=a"),
+                             name("https://x.instructure.com/courses/1/files/456/download"))
+        finally:
+            qd.IMAGES = None
+
+    def test_min_container_must_be_whole(self):
+        path = self.export({"non_cc_assessments/gb.xml.qti": bank("gb", "B", [item(*OrphanBanks.Q1)])})
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "--min-container", "2.9"]), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            qd.main()
+
+    def test_unreadable_pick_count_is_reported(self):
+        xml = quiz("gq", "Exam", [], draws=[("gb", 3)]).replace("<selection_number>3<", "<selection_number>three<")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            _, _, _, containers = qd.collect_questions([self.export({"non_cc_assessments/gq.xml.qti": xml})])
+        self.assertEqual(containers[0].draws, [("gb", None)])
+        self.assertIn("unreadable pick count ('three')", err.getvalue())
 
 
 class Images(ExportCase):
