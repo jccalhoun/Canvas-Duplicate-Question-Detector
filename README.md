@@ -113,7 +113,7 @@ The JSON file holds the same findings as the HTML report, in the same order, for
 | --- | --- |
 | `generated`, `settings`, `summary`, `question_images` | Run date, the options used, overall counts, and how question images were compared |
 | `bank_usage_audit`, `classic_bank_links` | Each bank's usage status, orphan verdict, how many of its questions are also stored elsewhere (`also_stored_elsewhere`), the kept banks it relies on or is kept for, and how many quiz questions point back to a bank question |
-| `quiz_coverage` | For each quiz with questions of its own: how many are in a linked bank, only in banks no quiz links to, only modified in a bank, or in no bank, and the questions in the last three groups |
+| `quiz_coverage` | For each quiz with questions of its own: the bank with the same questions (if any), the fewest banks covering it (`covered_by`), counts of questions in a linked bank, only in banks no quiz links to, only reworded in a bank, or in no bank, and the questions in the last three groups |
 | `quizzes_and_banks` | Every quiz and bank, with what each quiz draws or uses from banks |
 | `identical_quizzes_and_banks`, `mostly_contained`, `quizzes_with_nothing_in_export` | The whole-quiz and whole-bank findings |
 | `modified_questions`, `similar_wording_different_answer` | Clusters of versions |
@@ -168,17 +168,18 @@ The statuses can be checked against the Unused Classic Quiz Bank Checker: its *U
 
 ## Quiz coverage
 
-The second section answers a question for every quiz that stores questions of its own: if this quiz were retired, would anything be lost? Each distinct question in the quiz is put in one of these:
+The second section answers one question for every quiz that has questions of its own: which banks already hold them? Each quiz gets a sentence or two:
 
-| Found | Meaning |
-|---|---|
-| in a bank as is | the same question is in a bank |
-| only as a modified version | no bank has it unchanged, but a version from the same *Modified questions* group is in a bank. Each one links to its group so you can compare the wording |
-| in no bank | neither the question nor any version of it is in a bank |
+- **Has the same questions as the bank X.** The quiz's questions could be replaced with a question group that picks all of them from that bank.
+- **Every question is in the bank X**, which also has some other questions.
+- **Every question is in a bank, spread over N banks**, with how many each bank adds. The fewest banks that cover the quiz are picked, preferring a bank a quiz already links to, then the smallest.
+- How many questions are in a bank **only as a reworded version**, and how many are in **no bank**.
 
-A question counted as *in a bank as is* can still be at risk. When every bank holding it is one no quiz links to, the card says so. It names the banks that hold such a question alone or are marked safe to delete, with how many of these questions each holds and how many are in no other bank. Other banks are counted rather than named, and every bank is still listed beside each question in the card's question list. The bank check counts a quiz's own questions as in use, so it can mark such a bank *Safe to delete* because the quiz holds copies. The quiz and the bank then vouch for each other, and deleting both loses the questions. The card is highlighted with a warning only in that case: when this quiz holds the only quiz copy of a question and a bank holding it is marked safe to delete. If another quiz also has a copy, or the banks are not marked safe, the note stays plain.
+A **Keep X** note appears when the bank check calls a bank safe to delete only because this quiz holds copies of its questions, and no other quiz does. The quiz and the bank vouch for each other, so if you change the quiz, keep the bank.
 
-The heading of each card gives the question count. Distinct questions are shown too when the quiz repeats a question. Quizzes that share a title are numbered (`#29`) and show their first question, as same-named banks do. A question Canvas could not export is written with the type `Error` and only its text. The report says so wherever it shows one. Quizzes that only draw questions from banks are not listed, since their questions already live in the banks. Questions removed with `--exclude-type` are not counted. Cards are sorted by title and work with the title filter, so typing part of a quiz's name brings up its card.
+Each card can be expanded to show the reworded questions (each linked to its group in *Modified questions*, where the wording diff is), the questions in no bank, and which banks hold each question.
+
+The heading of each card gives the question count. Distinct questions are shown too when the quiz repeats a question. Quizzes that share a title are numbered (`#29`) and show their first question, as same-named banks do. A question Canvas could not export is written with the type `Error` and only its text. The report says so wherever it shows one. Quizzes that draw all their questions from banks are not listed. Questions removed with `--exclude-type` are not counted. Cards are sorted by title and work with the title filter.
 
 ## Duplicate quizzes and banks
 
