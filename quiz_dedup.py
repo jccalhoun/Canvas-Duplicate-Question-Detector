@@ -2028,9 +2028,11 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
         elif v == VERDICT_COPY:
             examples = sorted(banks, key=lambda b: (-len(b.kept_for), b.bank.title.lower()))[:8]
             extra = "<ul>" + "".join(
-                f"<li>Keep {bank_link(b)}. {plural(len(b.kept_for), 'bank relies', 'banks rely')} on it for "
-                f"questions found nowhere else in use: {bank_links(b.kept_for, 4)}.</li>"
-                for b in examples if b.kept_for) + "</ul>"
+                (f"<li>Keep {bank_link(b)}. {plural(len(b.kept_for), 'bank relies', 'banks rely')} on it for "
+                 f"questions found nowhere else in use: {bank_links(b.kept_for, 4)}.</li>" if b.kept_for else
+                 f"<li>Keep {bank_link(b)}. It holds questions that are otherwise only in other banks "
+                 f"kept as the one copy.</li>")
+                for b in examples) + "</ul>"
         elif v in (VERDICT_SAFE, VERDICT_COVERED, VERDICT_REVIEW):
             extra = f"<p class='src'>{bank_links(banks, 6)}</p>"
         summary_items += f"<li>{head}{extra}</li>"
