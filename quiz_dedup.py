@@ -95,7 +95,7 @@ class ImageStore:
 
             def read(rel):
                 full = os.path.realpath(os.path.join(root, rel))
-                if full.startswith(root + os.sep) and os.path.isfile(full):
+                if full.startswith(os.path.join(root, "")) and os.path.isfile(full):
                     with open(full, "rb") as f:
                         return f.read()
                 return None
@@ -182,6 +182,15 @@ def strip_html(text):
     return text
 
 
+# sign -> word, applied in this order (two-character signs first)
+MATH_WORDS = (
+    (r"<=|\u2264", "le"), (r">=|\u2265", "ge"), (r"!=|\u2260", "ne"),
+    (r"<", "lt"), (r">", "gt"), (r"=", "eq"), (r"\+", "plus"), (r"%", "percent"),
+    (r"\u00d7|(?<=[\w)])\s?\*\s?(?=[\w(])", "times"), (r"\u00f7", "div"),
+    (r"(?<=\d)\s?/\s?(?=\d)", "over"),
+)
+
+
 def normalize(text):
     """Aggressive normalization for exact-duplicate grouping."""
     # a picture becomes one opaque word, so two file names that look alike
@@ -194,7 +203,11 @@ def normalize(text):
     text = re.sub(r"(?<![\w.])[-\u2212](?=\.?\d)", " minus ", text)
     # x-5 is not x5: a minus after a letter is kept too
     text = re.sub(r"(?<=[^\W\d_])\s?[-\u2212]\s?(?=\.?\d)", " minus ", text)
-    text = re.sub(r"(?<=\d)[-\u2013](?=\d)", " ", text)
+    text = re.sub(r"(?<=\d)[-\u2013\u2212](?=\d)", " ", text)
+    # comparison and arithmetic signs carry meaning: x < 3 is not x > 3,
+    # 1/2 is not 12, 50% is not 50. They become words before punctuation goes.
+    for pattern, word in MATH_WORDS:
+        text = re.sub(pattern, f" {word} ", text)
     text = re.sub(r"(?<!\w)\.(?=\d)", "0_", text)
     text = re.sub(r"(?<=\d)\.(?=\d)", "_", text)
     text = re.sub(r"[^\w\s]", "", text)  # drop punctuation
@@ -403,6 +416,17 @@ def bank_picks(container):
             if local(el.tag) == "bankentry_item" and el.get("sourcebank_ref")]
 
 
+def own_items(container):
+    """The <item>s of a quiz or bank, not counting any inside a quiz or bank
+    nested in it (Canvas does not nest them, but a hand-made file might)."""
+    for c in container:
+        t = local(c.tag)
+        if t == "item":
+            yield c
+        elif t not in CONTAINER_TAGS:
+            yield from own_items(c)
+
+
 def parse_quiz_xml(path, source_file):
     """Parse one QTI file (a quiz's <assessment> or a bank's <objectbank>).
     Returns (questions, containers): the questions stored in the file, and a
@@ -428,8 +452,8 @@ def parse_quiz_xml(path, source_file):
         containers.append(Container(source_file, source_kind, quiz_id, quiz_title, engine,
                                     bank_draws(assessment), bank_picks(assessment)))
 
-        for item in assessment.iter():
-            if local(item.tag) == "item":
+        for item in own_items(assessment):
+            if True:
                 item_id = item.get("ident", "")
                 item_title = item.get("title", "")
 
@@ -1167,10 +1191,13 @@ def describe_contents(c):
     if c.picks:
         parts.append(f"uses {plural(len(c.picks), 'bank question')}")
     if c.draws:
-        counts = [n for _, n in c.draws]
-        banks = plural(len({bank_id for bank_id, _ in c.draws}), "bank")
-        parts.append(f"uses all of {banks}" if None in counts and len(counts) == 1 else
-                     f"draws from {banks}" if None in counts else f"draws {sum(counts)} from {banks}")
+        whole = {b for b, n in c.draws if n is None}   # New Quizzes: every question in the bank
+        counted = [(b, n) for b, n in c.draws if n is not None]
+        if whole:
+            parts.append(f"uses all of {plural(len(whole), 'bank')}")
+        if counted:
+            parts.append(f"draws {sum(n for _, n in counted)} from "
+                         f"{plural(len({b for b, _ in counted}), 'bank')}")
     return " + ".join(parts)
 
 
