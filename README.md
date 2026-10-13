@@ -25,6 +25,8 @@ It is meant for courses that have been copied forward for years and have collect
 pip install rapidfuzz numpy
 ```
 
+The action plan (`--plan`) also needs [openpyxl](https://openpyxl.readthedocs.io/): `pip install openpyxl`.
+
 ## Getting an export from Canvas
 
 1. In the course, go to **Settings**, then **Export Course Content**.
@@ -50,6 +52,7 @@ python3 quiz_dedup.py fall.imscc spring.imscc -o report.html
 | `sources` | (required) | One or more `.imscc` or `.zip` exports, or folders of already-extracted exports |
 | `-o`, `--output` | `quiz_duplicate_report.html` | Where to write the report |
 | `--json PATH` | (none) | Also write the findings to `PATH` as JSON |
+| `--plan PATH` | (none) | Also write an action plan to `PATH`, an `.xlsx` file (see *Action plan*) |
 | `-t`, `--threshold` | `85` | How similar (0 to 100) the stem or the choices must be for two questions to count as versions of each other |
 | `--word-overlap` | `60` | When two stems are worded differently, how much of their distinctive wording (0 to 100) they must share to count as the same question |
 | `--container-overlap` | `80` | List a quiz or bank as mostly contained in another when at least this percent of its questions are also there |
@@ -113,7 +116,7 @@ The JSON file holds the same findings as the HTML report, in the same order, for
 | --- | --- |
 | `generated`, `settings`, `summary`, `question_images` | Run date, the options used, overall counts, and how question images were compared |
 | `bank_usage_audit`, `classic_bank_links` | Each bank's usage status, orphan verdict, how many of its questions are also stored elsewhere (`also_stored_elsewhere`), the kept banks it relies on or is kept for, and how many quiz questions point back to a bank question |
-| `quiz_coverage` | For each quiz with questions of its own: how many are in a linked bank, only in banks no quiz links to, only modified in a bank, or in no bank, and the questions in the last three groups |
+| `quiz_coverage` | For each quiz with questions of its own: the bank with the same questions (if any), the fewest banks covering it (`covered_by`), counts of questions in a linked bank, only in banks no quiz links to, only reworded in a bank, or in no bank, and the questions in the last three groups |
 | `quizzes_and_banks` | Every quiz and bank, with what each quiz draws or uses from banks |
 | `identical_quizzes_and_banks`, `mostly_contained`, `quizzes_with_nothing_in_export` | The whole-quiz and whole-bank findings |
 | `modified_questions`, `similar_wording_different_answer` | Clusters of versions |
@@ -168,17 +171,38 @@ The statuses can be checked against the Unused Classic Quiz Bank Checker: its *U
 
 ## Quiz coverage
 
-The second section answers a question for every quiz that stores questions of its own: if this quiz were retired, would anything be lost? Each distinct question in the quiz is put in one of these:
+The second section answers one question for every quiz that has questions of its own: which banks already hold them? Each quiz gets a sentence or two:
 
-| Found | Meaning |
-|---|---|
-| in a bank as is | the same question is in a bank |
-| only as a modified version | no bank has it unchanged, but a version from the same *Modified questions* group is in a bank. Each one links to its group so you can compare the wording |
-| in no bank | neither the question nor any version of it is in a bank |
+- **Has the same questions as the bank X.** The quiz's questions could be replaced with a question group that picks all of them from that bank.
+- **Every question is in the bank X**, which also has some other questions.
+- **Every question is in a bank, spread over N banks**, with how many each bank adds. The fewest banks that cover the quiz are picked, preferring a bank a quiz already links to, then the smallest.
+- How many questions are in a bank **only as a reworded version**, and how many are in **no bank**.
 
-A question counted as *in a bank as is* can still be at risk. When every bank holding it is one no quiz links to, the card says so. It names the banks that hold such a question alone or are marked safe to delete, with how many of these questions each holds and how many are in no other bank. Other banks are counted rather than named, and every bank is still listed beside each question in the card's question list. The bank check counts a quiz's own questions as in use, so it can mark such a bank *Safe to delete* because the quiz holds copies. The quiz and the bank then vouch for each other, and deleting both loses the questions. The card is highlighted with a warning only in that case: when this quiz holds the only quiz copy of a question and a bank holding it is marked safe to delete. If another quiz also has a copy, or the banks are not marked safe, the note stays plain.
+A **Keep X** note appears when the bank check calls a bank safe to delete only because this quiz holds copies of its questions, and no other quiz does. The quiz and the bank vouch for each other, so if you change the quiz, keep the bank.
 
-The heading of each card gives the question count. Distinct questions are shown too when the quiz repeats a question. Quizzes that share a title are numbered (`#29`) and show their first question, as same-named banks do. A question Canvas could not export is written with the type `Error` and only its text. The report says so wherever it shows one. Quizzes that only draw questions from banks are not listed, since their questions already live in the banks. Questions removed with `--exclude-type` are not counted. Cards are sorted by title and work with the title filter, so typing part of a quiz's name brings up its card.
+Each card can be expanded to show the reworded questions (each linked to its group in *Modified questions*, where the wording diff is), the questions in no bank, and which banks hold each question.
+
+The heading of each card gives the question count. Distinct questions are shown too when the quiz repeats a question. Quizzes that share a title are numbered (`#29`) and show their first question, as same-named banks do. A question Canvas could not export is written with the type `Error` and only its text. The report says so wherever it shows one. Quizzes that draw all their questions from banks are not listed. Questions removed with `--exclude-type` are not counted. Cards are sorted by title and work with the title filter.
+
+## Action plan
+
+```
+python3 quiz_dedup.py export.imscc -o report.html --plan plan.xlsx
+```
+
+The report answers "what is duplicated where". The action plan answers "what do I do next" when the goal is to get quiz questions into banks. It is a spreadsheet you can open in Excel or Google Sheets, with one row per decision and a Done column to tick:
+
+- **Quizzes**: one row per quiz that has questions of its own, in the order to work through them.
+  - **Step 1, swap for a question group**: the quiz has the same questions as a bank. Delete its questions and add a question group that picks all of them from that bank.
+  - **Step 2, inside a bigger bank**: every question is in one bank that has more. Draw at random from it, or copy the questions into a bank of their own.
+  - **Step 3, spread over banks**: copy the questions into one new bank and use one question group.
+  - **Step 4, put questions in a bank first**: some questions are in no bank, or only as a reworded version. A quiz whose missing questions are all essay, numerical and similar types is flagged as possibly an assignment you would rather leave alone.
+
+  The **Keep** column names banks the quiz depends on: the bank check calls them safe to delete only because this quiz has the only other copy of some of their questions.
+- **Banks**: the banks the bank check calls safe to delete, with why, and whether to go ahead. **yes** means delete it. **wait** means a quiz you have not changed yet holds the only other copy of some of its questions. **no** means the plan has a quiz draw from it, so it will be in use.
+- **Questions**: every question from a step 4 quiz that is in no bank, or only reworded in one, with its type, choices and answer, ready to add to a bank.
+
+Quizzes and banks that share a title carry the same `#` number as in the report. Nothing is changed in Canvas: the plan is a checklist for doing the work by hand. After a round of changes, export the course again and rerun. Finished work drops off and the plan gets shorter.
 
 ## Duplicate quizzes and banks
 

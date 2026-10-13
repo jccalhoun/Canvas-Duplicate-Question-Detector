@@ -1570,6 +1570,22 @@ class QuizCoverage:
     # in no bank as is, but a modified version is: {variant index: (modified group number, [(export, bank id)])}
     modified: dict = field(default_factory=dict)
     missing: list = field(default_factory=list)     # in no bank, in any version
+    banks: dict = field(default_factory=dict)       # {variant index: [(export, bank id)]} for every question in a bank as is
+    linked_banks: set = field(default_factory=set)  # (export, bank id) of the linked banks among them
+
+    def cover(self, bank_sizes):
+        """The fewest banks that between them hold every question found in a
+        bank as is, picked greedily: the bank holding the most of the quiz's
+        questions not yet covered, ties going to a linked bank, then the
+        smaller bank (closest to the quiz itself), then the export id.
+        Returns [((export, bank id), how many it adds)]."""
+        left, picked = dict(self.banks), []
+        while left:
+            counts = Counter(k for keys in left.values() for k in keys)
+            best = min(counts, key=lambda k: (-counts[k], k not in self.linked_banks, bank_sizes.get(k, 0), k))
+            picked.append((best, counts[best]))
+            left = {i: keys for i, keys in left.items() if best not in keys}
+        return picked
 
 
 def quiz_coverage(variants, containers, cluster_of, audit):
@@ -1595,6 +1611,9 @@ def quiz_coverage(variants, containers, cluster_of, audit):
         cov = QuizCoverage(c, len(idxs))
         for i in sorted(idxs):
             banks = banks_of[i]
+            if banks:
+                cov.banks[i] = sorted(banks)
+                cov.linked_banks |= banks & linked
             if banks & linked:
                 cov.in_linked.append(i)
             elif banks:
@@ -1976,8 +1995,14 @@ def build_json_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
         out = ref(cov.quiz)
         stem = lambda i: ctx["variants"][i].rep.text
         banks = lambda keys: [{"id": k[1], "title": bank_titles.get(k)} for k in keys]
+        sizes = {k: held for k, (held, _, _) in spread.items()}
+        cover = cov.cover(sizes)
+        same = (cover[0][0] if len(cover) == 1 and len(cov.banks) == cov.distinct
+                and sizes.get(cover[0][0], 0) <= cov.distinct else None)
         out.update({
             "distinct_questions": cov.distinct,
+            "same_questions_as_bank": banks([same])[0] if same else None,
+            "covered_by": [dict(banks([k])[0], questions=added) for k, added in cover],
             "in_a_linked_bank": len(cov.in_linked),
             "only_in_banks_no_quiz_links_to": len(cov.in_unlinked),
             "only_modified_in_a_bank": len(cov.modified),
@@ -2030,6 +2055,229 @@ def build_json_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
             {"export": src, "quiz": title, "bank_id": bank, "same_id_found_in": elsewhere or None}
             for src, title, bank, elsewhere in unresolved],
     }
+
+
+# ---------------------------------------------------------------------------
+# Action plan (--plan): a to-do list for moving quiz questions into banks
+# ---------------------------------------------------------------------------
+# question types that usually mean a survey, reflection or assignment rather than
+# a question worth banking
+ASSIGNMENT_TYPES = {"essay_question", "numerical_question", "file_upload_question", "text_only_question"}
+
+PLAN_STEPS = {
+    1: "Swap for a question group",
+    2: "Inside a bigger bank",
+    3: "Spread over banks",
+    4: "Put questions in a bank first",
+}
+
+
+def keep_for_quiz(cov, variants, bank_info):
+    """Banks the bank check calls safe to delete only because this quiz holds
+    the only quiz copy of some of their questions: (export, bank id) keys.
+    Deleting one of them and then changing the quiz loses those questions."""
+    here = (cov.quiz.source_file, cov.quiz.cid)
+    sole = [i for i in cov.in_unlinked
+            if not any(q.source_kind == "quiz" and (q.source_file, q.quiz_id) != here for q in variants[i].occurrences)]
+    return {k for i in sole for k in cov.in_unlinked[i]
+            if k in bank_info and bank_info[k].verdict in (VERDICT_SAFE, VERDICT_COVERED)}
+
+
+def build_plan(variants, coverage, audit, bank_sizes, show_source=False):
+    """The action plan as plain data: {"quizzes": [...], "banks": [...],
+    "questions": [...]}, each a list of row dicts in the order to work
+    through them. `coverage` is quiz_coverage()'s list in report order, so
+    a quiz numbered #12 here is #12 in the report too, and banks are
+    numbered as in the report's bank check."""
+    bank_info = {(b.bank.source_file, b.bank.cid): b for b in audit}
+    bank_number = {(b.bank.source_file, b.bank.cid): n for n, b in enumerate(audit, 1)}
+    bank_names = Counter((b.bank.source_file, b.bank.title.lower()) for b in audit)
+    quiz_names = Counter((cov.quiz.source_file, cov.quiz.title.lower()) for cov in coverage)
+
+    def bank_label(key):
+        b = bank_info.get(key)
+        if b is None:
+            return key[1]
+        label = b.bank.title.strip()
+        if bank_names[(key[0], b.bank.title.lower())] > 1:
+            label += f" #{bank_number[key]}"
+        return label + (f" [{key[0]}]" if show_source else "")
+
+    def listing(items, limit=4):
+        items = list(items)
+        shown = ", ".join(items[:limit])
+        return shown + (f" and {len(items) - limit} more" if len(items) > limit else "")
+
+    quiz_rows, question_rows, holds, uses = [], [], {}, {}
+    for n, cov in enumerate(coverage, 1):
+        c = cov.quiz
+        label = c.title.strip()
+        if quiz_names[(c.source_file, c.title.lower())] > 1:
+            label += f" #{n}"
+        if show_source:
+            label += f" [{c.source_file}]"
+        d, in_bank = cov.distinct, len(cov.banks)
+        cover = cov.cover(bank_sizes)
+        spread = listing([f"{bank_label(k)} ({added})" for k, added in cover], 6)
+        if in_bank == d and len(cover) == 1:
+            key = cover[0][0]
+            size = bank_sizes.get(key, 0)
+            if size <= d:
+                step = 1
+                action = (f"Delete the quiz's questions and add a question group that picks all {d} "
+                          f"from the bank.")
+            else:
+                step = 2
+                action = (f"All {d} questions are in this bank, which has {size}. Either add a question group "
+                          f"that picks {d} from it (students get a random {d}), or copy these {d} into a new "
+                          f"bank and pick all {d} from that.")
+            banks = bank_label(key)
+            uses.setdefault(key, []).append(label)
+        elif in_bank == d:
+            step = 3
+            action = (f"Its questions are in {plural(len(cover), 'bank')}. Copy them into one new bank, then "
+                      f"replace them with a question group that picks all {d}.")
+            banks = spread
+        else:
+            step = 4
+            others = d - in_bank
+            action = ((f"{in_bank} of {d} questions are in a bank. Put the other {others} into a bank first"
+                       if in_bank else f"None of its {d} questions are in a bank. Put them into a bank first")
+                      + " (they are on the Questions tab), then handle it like steps 1 to 3.")
+            outside = [variants[i].rep.question_type for i in list(cov.modified) + cov.missing]
+            if outside and all(t in ASSIGNMENT_TYPES for t in outside):
+                action += (" Those are all essay, numerical or similar questions, so this may be an "
+                           "assignment you would rather leave as a quiz.")
+            banks = spread if in_bank else ""
+            for i, (group, keys) in cov.modified.items():
+                question_rows.append((label, i, f"Reworded version in {listing(bank_label(k) for k in keys)}",
+                                      f"Modified questions, group {group}"))
+            for i in cov.missing:
+                question_rows.append((label, i, "In no bank", ""))
+        keep = sorted(keep_for_quiz(cov, variants, bank_info), key=lambda k: bank_label(k).lower())
+        for k in keep:
+            holds.setdefault(k, []).append(label)
+        quiz_rows.append({
+            "step": step, "what": PLAN_STEPS[step], "quiz": label, "questions": d,
+            "published": {True: "yes", False: "no"}.get(c.published, ""),
+            "action": action, "banks": banks,
+            "keep": (f"Keep {listing(bank_label(k) for k in keep)}: this quiz has the only other copy of some "
+                     "of their questions." if keep else ""),
+        })
+    quiz_rows.sort(key=lambda r: (r["step"], r["quiz"].lower()))
+
+    bank_rows = []
+    for b in audit:
+        if b.verdict not in (VERDICT_SAFE, VERDICT_COVERED):
+            continue
+        key = (b.bank.source_file, b.bank.cid)
+        places = sorted({t.strip() for f in b.findings if f.coverage == "exact" for t in f.places}, key=str.lower)
+        why = f"Every question is also in use in {listing(places)}." if places else "Every question is in use elsewhere."
+        before = ""
+        if b.verdict == VERDICT_COVERED:
+            relied = [bank_label((o.bank.source_file, o.bank.cid)) for o in b.relies_on]
+            why = ("Every question is in use elsewhere or in a bank kept as the one copy"
+                   + (f" ({listing(relied)})" if relied else "") + ".")
+            if relied:
+                before = f"Delete only while you keep {listing(relied)}."
+        waiting, drawn = holds.get(key, []), uses.get(key, [])
+        ready = "yes"
+        if drawn:
+            ready = "no"
+            before = (f"Keep: the plan for {listing(drawn)} uses this bank for a question group (step 1 or 2 on "
+                      "the Quizzes tab). Once it does, the bank is in use and drops off this list.")
+        elif waiting:
+            ready = "wait"
+            before = (f"Wait: {listing(waiting)} {'has' if len(waiting) == 1 else 'have'} the only other copy "
+                      "of some of its questions. Change that quiz first, then rerun and check again.")
+        bank_rows.append({
+            "ready": ready, "bank": bank_label(key), "questions": b.bank.item_count,
+            "status": b.status, "verdict": VERDICT_LABELS[b.verdict], "why": why, "before": before,
+        })
+    bank_rows.sort(key=lambda r: (["yes", "wait", "no"].index(r["ready"]), r["bank"].lower()))
+
+    questions = []
+    for label, i, status, where in question_rows:
+        q = variants[i].rep
+        questions.append({
+            "quiz": label, "type": type_label(q.question_type), "status": status, "question": q.text,
+            "choices": " | ".join(q.choices), "answer": " | ".join(q.correct), "report": where,
+        })
+    return {"quizzes": quiz_rows, "banks": bank_rows, "questions": questions}
+
+
+def write_plan(path, plan, sources):
+    """Write the action plan to an Excel file with a tab each for how to use
+    it, the quizzes, the banks safe to delete, and the questions to put in a
+    bank."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+    except ImportError:
+        sys.exit("--plan needs the openpyxl package: pip install openpyxl")
+    wb = Workbook()
+    readme = wb.active
+    readme.title = "How to use"
+    steps = Counter(r["step"] for r in plan["quizzes"])
+    ready = sum(1 for r in plan["banks"] if r["ready"] == "yes")
+    lines = [
+        ("Plan for moving quiz questions into banks", True),
+        (f"Made {date.today().isoformat()} from {', '.join(sources)}.", False),
+        ("", False),
+        ("1. Work through the Quizzes tab from the top. Steps are in the order to do them; tick Done as you go.", False),
+        (f"   Step 1 ({steps[1]}): the quiz has the same questions as a bank. Replace them with a question "
+         "group that picks all of them from that bank.", False),
+        (f"   Step 2 ({steps[2]}): the questions are all in one bigger bank. Draw at random from it, or copy "
+         "them into a bank of their own.", False),
+        (f"   Step 3 ({steps[3]}): the questions are spread over several banks. Copy them into one new bank "
+         "and use one question group.", False),
+        (f"   Step 4 ({steps[4]}): some questions are in no bank, or only as a reworded version. They are "
+         "listed on the Questions tab.", False),
+        ("2. Respect the Keep column. It names banks this quiz depends on: delete one and change the quiz, "
+         "and those questions are gone.", False),
+        (f"3. The Banks tab lists banks the bank check calls safe to delete. Delete only rows marked yes ({ready} "
+         "now). Wait means a quiz you have not changed yet holds the only other copy of some of its questions; "
+         "no means the plan has a quiz draw from it.", False),
+        ("4. Banks not on the Banks tab hold questions found nowhere else, or need a look first. See the "
+         "report's bank check.", False),
+        ("5. After a round of changes, export the course again and rerun with --plan. Finished work drops off "
+         "and the plan gets shorter.", False),
+    ]
+    for text, bold in lines:
+        readme.append([text])
+        if bold:
+            readme.cell(readme.max_row, 1).font = Font(bold=True, size=13)
+    readme.column_dimensions["A"].width = 120
+
+    head_font, head_fill = Font(bold=True), PatternFill("solid", fgColor="DDE6F0")
+    wrap = Alignment(wrap_text=True, vertical="top")
+
+    def sheet(title, columns, rows):
+        ws = wb.create_sheet(title)
+        ws.append([name for name, _, _ in columns])
+        for cell in ws[1]:
+            cell.font, cell.fill = head_font, head_fill
+        for row in rows:
+            ws.append([row.get(key, "") if key else "" for _, key, _ in columns])
+        for n, (_, _, width) in enumerate(columns, 1):
+            ws.column_dimensions[ws.cell(1, n).column_letter].width = width
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = wrap
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        return ws
+
+    sheet("Quizzes", [("Step", "step", 6), ("What", "what", 22), ("Quiz", "quiz", 34), ("Questions", "questions", 10),
+                      ("Published", "published", 10), ("What to do", "action", 60), ("Bank", "banks", 40),
+                      ("Keep", "keep", 40), ("Done", None, 8)], plan["quizzes"])
+    sheet("Banks", [("Ready to delete", "ready", 9), ("Bank", "bank", 40), ("Questions", "questions", 10),
+                    ("Status", "status", 11), ("Verdict", "verdict", 20), ("Why it is safe", "why", 60),
+                    ("Before deleting", "before", 50), ("Done", None, 8)], plan["banks"])
+    sheet("Questions", [("Quiz", "quiz", 30), ("Type", "type", 22), ("Where it is", "status", 30),
+                        ("Question", "question", 60), ("Choices", "choices", 45), ("Answer", "answer", 30),
+                        ("In the report", "report", 20), ("Done", None, 8)], plan["questions"])
+    wb.save(path)
 
 
 def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, same_choice_groups, repeated,
@@ -2510,107 +2758,109 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
     coverage = ctx.get("quiz_coverage", [])
     bank_info = {(b.bank.source_file, b.bank.cid): b for b in audit}
     bank_titles = {(c.source_file, c.cid): c.title for c in ctx["containers"] if c.kind == "bank"}
+    bank_sizes = {k: held for k, (held, _, _) in spread.items()}
 
-    def bank_desc(key, with_verdict=True):
+    def bank_name(key, strong=True):
         b = bank_info.get(key)
-        title = esc(bank_titles.get(key) or (b.bank.title if b else key[1]))
-        if b is None:
-            return title
-        state = VERDICT_LABELS[b.verdict] if with_verdict and b.verdict else b.status
-        return f"{title}{tag_span(b)} <span class='src'>({esc(state)})</span>"
+        title = esc(bank_titles.get(key) or key[1])
+        return (f"<strong>{title}</strong>" if strong else title) + (tag_span(b) if b else "")
+
+    def name_list(keys):
+        names = [bank_name(k) for k in keys]
+        return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
 
     def question_list(entries):
         return "<ul class='containers'>" + "".join(f"<li>{e}</li>" for e in entries) + "</ul>"
+
+    def are(n, one="is", many="are"):
+        return one if n == 1 else many
 
     coverage_cards = ""
     quiz_title_count = Counter((cov.quiz.source_file, cov.quiz.title.lower()) for cov in coverage)
     for n, cov in enumerate(coverage, 1):
         c = cov.quiz
+        mine = list(cov.banks) + list(cov.modified) + cov.missing
+        here = (c.source_file, c.cid)
+        copies = [q for i in mine for q in variants[i].occurrences
+                  if q.source_kind == "quiz" and (q.source_file, q.quiz_id) == here]
         same_name, hint = "", ""
         if quiz_title_count[(c.source_file, c.title.lower())] > 1:
             same_name = f" <span class='src'>#{n}</span>"
-            first = min((q for i in cov.in_linked + list(cov.in_unlinked) + list(cov.modified) + cov.missing
-                         for q in variants[i].occurrences
-                         if q.source_kind == "quiz" and (q.source_file, q.quiz_id) == (c.source_file, c.cid)),
-                        key=lambda q: q.item_id, default=None)
+            first = min(copies, key=lambda q: q.item_id, default=None)
             if first is not None:
                 hint = f"<p class='src'>first question: {esc(short(first.text, 70))}</p>"
-        stored = sum(1 for i in (cov.in_linked + list(cov.in_unlinked) + list(cov.modified) + cov.missing)
-                     for q in variants[i].occurrences
-                     if q.source_kind == "quiz" and (q.source_file, q.quiz_id) == (c.source_file, c.cid))
-        size = (f"{plural(stored, 'question')}" if stored == cov.distinct
-                else f"{plural(stored, 'question')}, {cov.distinct} distinct")
+        size = (plural(len(copies), "question") if len(copies) == cov.distinct
+                else f"{plural(len(copies), 'question')}, {cov.distinct} distinct")
         unpublished = " &middot; <span class='src'>unpublished</span>" if c.published is False else ""
-        in_bank = len(cov.in_linked) + len(cov.in_unlinked)
-        line = (f"{in_bank} of {cov.distinct} in a bank as is; {len(cov.modified)} only as a modified version; "
-                f"{len(cov.missing)} in no bank.")
-        notes, detail = "", ""
-        if cov.in_unlinked:
-            per_bank = Counter(k for keys in cov.in_unlinked.values() for k in keys)
-            sole = Counter(keys[0] for keys in cov.in_unlinked.values() if len(keys) == 1)
-            # the quiz's copy is what keeps such a question "in use" when no other quiz holds it,
-            # so a bank called safe to delete on the strength of it is the risky case
-            here = (c.source_file, c.cid)
-            sole_copy = [i for i in cov.in_unlinked
-                         if not any(q.source_kind == "quiz" and (q.source_file, q.quiz_id) != here
-                                    for q in variants[i].occurrences)]
-            safe = {k for i in sole_copy for k in cov.in_unlinked[i]
-                    if bank_info.get(k) and bank_info[k].verdict in (VERDICT_SAFE, VERDICT_COVERED)}
-            at_risk = sum(1 for i in sole_copy if safe & set(cov.in_unlinked[i]))
 
-            def only_here(k):
-                if not sole[k]:
-                    return ""
-                return ", all in no other bank" if sole[k] == per_bank[k] else f", {sole[k]} in no other bank"
-            # name the banks that matter (sole holders, banks called safe), fold the rest into a count;
-            # every bank is still named in the question list below
-            order = sorted(per_bank, key=lambda k: (-per_bank[k], bank_titles.get(k, "").lower()))
-            named = [k for k in order if sole[k] or k in safe] or order[:3]
-            if len(order) - len(named) == 1:
-                named = order
-            rest = len(order) - len(named)
-            banks_text = "; ".join(f"{bank_desc(k)}: {per_bank[k]}{only_here(k)}" for k in named)
-            if rest:
-                banks_text += f"; and {plural(rest, 'other bank')}, listed with each question below"
-            count = len(cov.in_unlinked)
-            head = (f"{plural(count, 'question')} {'is' if count == 1 else 'are'} only in banks no quiz links to:"
-                    f"</strong> {banks_text}.")
-            if safe:
-                names = ", ".join(f"{esc(bank_titles.get(k, k[1]))}{tag_span(bank_info[k])}"
-                                  for k in sorted(safe, key=lambda k: bank_titles.get(k, "").lower()))
-                notes += (f"<p class='coverage-warn'><strong>{head} For {plural(at_risk, 'question')} this quiz is "
-                          f"the only quiz with a copy, and the bank check calls {names} safe to delete because of "
-                          f"that copy. Delete this quiz and {'that bank' if len(safe) == 1 else 'those banks'} "
-                          f"and {'it is' if at_risk == 1 else 'they are'} gone.</p>")
+        # ---- the answer, in a sentence or two
+        lines = []
+        in_bank, cover = len(cov.banks), cov.cover(bank_sizes)
+        if in_bank == cov.distinct and len(cover) == 1:
+            key = cover[0][0]
+            extra = bank_sizes.get(key, 0) - cov.distinct
+            if extra <= 0:
+                lines.append(f"Has the same questions as the bank {bank_name(key)}. Its questions could be "
+                             f"replaced with a question group that picks all {cov.distinct} from that bank.")
             else:
-                notes += f"<p class='src'><strong>{head}</p>"
-            detail += ("<details><summary>Questions only in banks no quiz links to</summary>" + question_list(
-                f"{esc(short(variants[i].rep.text))} <span class='src'>&mdash; in "
-                f"{', '.join(bank_desc(k, False) for k in keys)}</span>"
-                for i, keys in cov.in_unlinked.items()) + "</details>")
+                lines.append(f"Every question is in the bank {bank_name(key)}, which also has "
+                             f"{plural(extra, 'other question')}.")
+        elif in_bank:
+            shown = cover[:5]
+            parts = [f"{bank_name(k)} ({added})" for k, added in shown]
+            if len(cover) > len(shown):
+                rest = cover[len(shown):]
+                parts.append(f"{plural(len(rest), 'more bank')} ({sum(a for _, a in rest)})")
+            where = ", ".join(parts[:-1]) + " and " + parts[-1] if len(parts) > 1 else parts[0]
+            lead = ("Every question is" if in_bank == cov.distinct
+                    else f"{in_bank} of {cov.distinct} questions {are(in_bank)}")
+            if len(cover) == 1:
+                lines.append(f"{lead} in the bank {bank_name(cover[0][0])}.")
+            else:
+                lines.append(f"{lead} in a bank, spread over {plural(len(cover), 'bank')}: {where}.")
         if cov.modified:
-            detail += ("<details open><summary>Only as a modified version in a bank</summary>" + question_list(
-                f"{esc(short(variants[i].rep.text))} <span class='src'>&mdash; a modified version is in "
-                f"{', '.join(bank_desc(k, False) for k in keys)} &middot; "
-                f"<a href='#modified-{group}'>group {group}</a></span>"
-                for i, (group, keys) in cov.modified.items()) + "</details>")
+            lines.append(f"{plural(len(cov.modified), 'question')} {are(len(cov.modified))} in a bank only "
+                         "as a reworded version.")
         if cov.missing:
-            detail += ("<details open><summary>In no bank</summary>" + question_list(
-                esc(short(variants[i].rep.text)) + (f" <span class='src'>({esc(type_label('Error'))})</span>"
-                                                    if variants[i].rep.question_type == "Error" else "")
-                for i in cov.missing) + "</details>")
+            lines.append("None of its questions are in a bank." if len(cov.missing) == cov.distinct else
+                         f"{plural(len(cov.missing), 'question')} {are(len(cov.missing))} in no bank.")
+
+        # ---- a bank the bank check calls safe to delete only because this quiz has copies of its questions
+        safe = sorted(keep_for_quiz(cov, variants, bank_info), key=lambda k: bank_titles.get(k, "").lower())
+        caution = ""
+        if safe:
+            caution = (f"<p class='coverage-warn'>Keep {name_list(safe)} if you change this quiz. The bank check "
+                       f"calls {are(len(safe), 'it', 'them')} safe to delete because this quiz has copies of "
+                       f"{are(len(safe), 'its', 'their')} questions.</p>")
+
+        # ---- the per-question detail, folded away
+        detail = ""
+        if cov.modified:
+            detail += (f"<details><summary>Show the {plural(len(cov.modified), 'reworded question')}</summary>"
+                       + question_list(
+                           f"{esc(short(variants[i].rep.text))} <span class='src'>&mdash; a reworded version is in "
+                           f"{', '.join(bank_name(k, False) for k in keys)} &middot; "
+                           f"<a href='#modified-{group}'>compare in group {group}</a></span>"
+                           for i, (group, keys) in cov.modified.items()) + "</details>")
         if cov.missing:
-            tone = "warn"
-        elif cov.modified or cov.in_unlinked:
-            tone = "near"
-        else:
-            tone = "plain"
+            detail += (f"<details><summary>Show the {plural(len(cov.missing), 'question')} in no bank</summary>"
+                       + question_list(
+                           esc(short(variants[i].rep.text)) + (f" <span class='src'>({esc(type_label('Error'))})</span>"
+                                                               if variants[i].rep.question_type == "Error" else "")
+                           for i in cov.missing) + "</details>")
+        if cov.banks and not (in_bank == cov.distinct and len(cover) == 1):
+            detail += ("<details><summary>Show which banks hold each question</summary>" + question_list(
+                f"{esc(short(variants[i].rep.text))} <span class='src'>&mdash; "
+                f"{', '.join(bank_name(k, False) for k in keys)}</span>"
+                for i, keys in cov.banks.items()) + "</details>")
+
+        tone = "warn" if cov.missing else ("near" if cov.modified else "plain")
         coverage_cards += f"""
             <div class="match-group {tone}" id="quiz-{n}"{filter_attrs("quiz-coverage", [c.title])}>
               <h3>[{esc(kind_label(c.kind, c.engine))}] <strong>{esc(c.title)}</strong>{same_name}{source(c)} &middot;
                 {size}{unpublished}</h3>
-              {hint}<p class='src'>{line}</p>
-              {notes}{detail}
+              {hint}<p>{' '.join(lines)}</p>
+              {caution}{detail}
             </div>
             """
     coverage_html = ""
@@ -2618,13 +2868,10 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
         full = sum(1 for cov in coverage if not (cov.modified or cov.missing))
         coverage_html = f"""
   <h2 id="quiz-coverage">Quiz coverage <a class="top" href="#contents">Contents &uarr;</a></h2>
-  <p>For each quiz that stores questions of its own: how many of its distinct questions are also in a bank
-  unchanged, how many are in a bank only as a modified version, and how many are in no bank at all.
-  Use it before retiring a quiz, to see what would be lost. Quizzes that only draw from banks are not listed,
-  since their questions already live in the banks.</p>
-  <p>{full} of {plural(len(coverage), 'quiz', 'quizzes')} have every question in a bank unchanged.
-  A question counted as in a bank may sit only in banks no quiz links to; those are called out, because the
-  bank check can mark such a bank safe to delete on the strength of the quiz's own copies.</p>
+  <p>Which banks already hold the questions of each quiz that has questions of its own. A quiz with the same
+  questions as a bank can have them replaced by a question group drawing from that bank. Quizzes that already
+  draw all their questions from banks are not listed.
+  {full} of {plural(len(coverage), 'quiz', 'quizzes')} have every question in a bank.</p>
   {coverage_cards}
   {no_match("quiz-coverage")}
 """
@@ -2851,6 +3098,10 @@ def main():
     ap.add_argument("-o", "--output", default="quiz_duplicate_report.html", help="Output HTML report path")
     ap.add_argument("--json", metavar="PATH",
                     help="Also write the findings to PATH as JSON, with the same sections as the report.")
+    ap.add_argument("--plan", metavar="PATH",
+                    help="Also write an action plan to PATH (an .xlsx file): what to do with each quiz to get its "
+                         "questions into banks, which banks are safe to delete, and which questions are in no bank. "
+                         "Needs openpyxl.")
     ap.add_argument("-t", "--threshold", type=float, default=85.0,
                     help="How similar the stem or the choices must be to call two questions "
                          "versions of each other, 0-100 (default 85). Lower finds heavier "
@@ -3035,6 +3286,12 @@ def main():
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
         print(f"JSON written to {args.json}")
+    if args.plan:
+        sizes = {key: held for key, (held, _, _) in bank_spread(variants, [b.bank for b in bank_audit],
+                                                                 cluster_of).items()}
+        plan = build_plan(variants, coverage, bank_audit, sizes, ctx["show_source"])
+        write_plan(args.plan, plan, export_labels(args.sources))
+        print(f"Action plan written to {args.plan}")
 
 
 if __name__ == "__main__":

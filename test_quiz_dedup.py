@@ -1444,17 +1444,21 @@ class QuizCoverageCheck(ExportCase):
         report, data = self.report()
         self.assertIn('id="quiz-coverage"', report)
         self.assertIn("href='#quiz-coverage'", report)
-        card = report[report.index("<strong>Old pool</strong>"):]
-        card = card[:card.index("</div>")]
+        card = self.card(report, "Old pool")
         self.assertIn("5 questions, 4 distinct", card)
-        self.assertIn("2 of 4 in a bank as is; 1 only as a modified version; 1 in no bank.", card)
-        self.assertIn("1 question is only in banks no quiz links to", card)
-        self.assertIn("Old final <span class='src'>#", card)  # same-named banks are told apart
+        # Q1 is in the linked Persuasion bank, Q3 in an Old final bank; the linked bank is picked first
+        self.assertRegex(card, r"<p>2 of 4 questions are in a bank, spread over 2 banks: <strong>Persuasion</strong> "
+                               r"<span class='src'>#\d+</span> \(1\) and <strong>Old final</strong> <span class='src'>#\d+</span> \(1\)\. "
+                               r"1 question is in a bank only as a reworded version\. 1 question is in no bank\.</p>")
+        self.assertIn("Show the 1 reworded question", card)
+        self.assertIn("Show the 1 question in no bank", card)
         self.assertIn(html.escape(self.Q6[1]), card)
         self.assertIn("href='#modified-", card)
         old = next(q for q in data["quiz_coverage"] if q["title"] == "Old pool")
         self.assertEqual((old["in_a_linked_bank"], old["only_in_banks_no_quiz_links_to"],
                           old["only_modified_in_a_bank"], old["in_no_bank"]), (1, 1, 1, 1))
+        self.assertEqual([(b["id"], b["questions"]) for b in old["covered_by"]], [("ga", 1), ("gd", 1)])
+        self.assertIsNone(old["same_questions_as_bank"])
         self.assertEqual(sorted(q["coverage"] for q in old["questions_to_review"]),
                          ["modified", "none", "only_in_unlinked_banks"])
         self.assertIn(["old pool"], [titles for _, section, titles in TitleFilter.blocks(None, report)
@@ -1464,84 +1468,135 @@ class QuizCoverageCheck(ExportCase):
         start = report.index(f"<strong>{title}</strong>")
         return report[start:report.index("</div>", start)]
 
-    def test_strong_warning_only_when_a_bank_is_marked_safe(self):
+    def run_files(self, files):
+        path = self.export(files)
+        out, target = os.path.join(self.dir, "report.html"), os.path.join(self.dir, "report.json")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out, "--json", target]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with open(out, encoding="utf-8") as f, open(target, encoding="utf-8") as g:
+            return f.read(), json.load(g)
+
+    def test_quiz_with_the_same_questions_as_a_bank(self):
+        files = self.course()
+        files["non_cc_assessments/gq4.xml.qti"] = quiz("gq4", "Final copy", [item(*self.Q3)])
+        report, data = self.run_files(files)
+        card = self.card(report, "Final copy")
+        self.assertIn("Has the same questions as the bank <strong>Old final</strong>", card)
+        self.assertIn("replaced with a question group that picks all 1 from that bank", card)
+        self.assertNotIn("<details>", card)  # nothing more to show
+        entry = next(q for q in data["quiz_coverage"] if q["title"] == "Final copy")
+        self.assertEqual(entry["same_questions_as_bank"]["id"], "gd")
+
+    def test_caution_only_when_a_bank_is_marked_safe(self):
         q7 = (MC, "Hearing is a physiological process; listening is what?",
               ["A psychological process", "A reflex", "A habit", "An accident"], ["A psychological process"])
         files = self.course()
         files["non_cc_assessments/gu.xml.qti"] = bank("gu", "Keeper", [item(*self.Q6), item(*q7)])
         files["non_cc_assessments/gq8.xml.qti"] = quiz("gq8", "Listening quiz", [item(*self.Q6)])
-        path = self.export(files)
-        out = os.path.join(self.dir, "report.html")
-        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out]), \
-                contextlib.redirect_stdout(io.StringIO()):
-            qd.main()
-        with open(out, encoding="utf-8") as f:
-            report = f.read()
-        # Keeper still has a question no quiz holds, so it is not called safe and the note stays plain
+        report, _ = self.run_files(files)
+        # Keeper still has a question no quiz holds, so it is not called safe: no caution
         listening = self.card(report, "Listening quiz")
-        self.assertIn("1 question is only in banks no quiz links to:</strong> Keeper", listening)
-        self.assertIn("(Has unique questions)", listening)
+        self.assertIn("Every question is in the bank <strong>Keeper</strong>, which also has 1 other question.",
+                      listening)
         self.assertNotIn("coverage-warn", listening)
         # Old pool's Q3 is only in the two Old final banks, which its copy makes safe to delete
         old_pool = self.card(report, "Old pool")
-        self.assertIn("coverage-warn", old_pool)
-        self.assertIn("For 1 question this quiz is the only quiz with a copy", old_pool)
+        self.assertRegex(old_pool, r"<p class='coverage-warn'>Keep <strong>Old final</strong>.* and "
+                                   r"<strong>Old final</strong>.* if you change this quiz\. The bank check calls them "
+                                   r"safe to delete because this quiz has copies of their questions\.</p>")
 
-    def test_no_strong_warning_when_another_quiz_also_has_a_copy(self):
-        # the Fallacies quiz copy of Q5 is only in Extra; a second quiz with the same copy means
-        # deleting either quiz alone loses nothing
+    def test_no_caution_when_another_quiz_also_has_a_copy(self):
+        # the Fallacies quiz copy of Q5 is only in Extra; with a second quiz holding the same copy,
+        # changing either quiz alone loses nothing
         files = self.course()
         files["non_cc_assessments/gq6.xml.qti"] = quiz("gq6", "Fallacies quiz 2", [item(*self.Q5)])
-        path = self.export(files)
-        out = os.path.join(self.dir, "report.html")
-        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out]), \
-                contextlib.redirect_stdout(io.StringIO()):
-            qd.main()
-        with open(out, encoding="utf-8") as f:
-            report = f.read()
+        report, _ = self.run_files(files)
         card = self.card(report, "Fallacies quiz 2")
-        self.assertIn("only in banks no quiz links to", card)
+        self.assertIn("Every question is in the bank <strong>Extra</strong>", card)
         self.assertNotIn("coverage-warn", card)
 
     def test_same_named_quizzes_are_numbered(self):
         files = self.course()
         files["non_cc_assessments/gq7.xml.qti"] = quiz("gq7", "Old pool", [item(*self.Q6)])
-        path = self.export(files)
-        out = os.path.join(self.dir, "report.html")
-        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out]), \
-                contextlib.redirect_stdout(io.StringIO()):
-            qd.main()
-        with open(out, encoding="utf-8") as f:
-            report = f.read()
+        report, _ = self.run_files(files)
         heads = [h for h in report.split("<strong>Old pool</strong>")[1:]]
         self.assertEqual(len(heads), 2)
         for h in heads:
             self.assertTrue(h.startswith(" <span class='src'>#"), h[:60])
             self.assertIn("first question: ", h[:600])
 
-    def test_long_bank_lists_are_folded(self):
-        others = ["Which organ pumps blood around the body?", "What gas do plants take in from the air?",
-                  "Which planet is known as the red planet?", "What is the boiling point of water at sea level?",
-                  "Which ocean is the largest on Earth?"]
+    def test_many_banks_are_summed_up(self):
+        stems = ["Which organ pumps blood around the body?", "What gas do plants take in from the air?",
+                 "Which planet is known as the red planet?", "What is the boiling point of water at sea level?",
+                 "Which ocean is the largest on Earth?", "Which metal is liquid at room temperature?"]
+        questions = [(MC, stem, ["Alpha", "Beta", "Gamma", "Delta"], ["Alpha"]) for stem in stems]
         files = self.course()
-        for k, stem in enumerate(others):
-            files[f"non_cc_assessments/gv{k}.xml.qti"] = bank(
-                f"gv{k}", f"Spread {k}", [item(*self.Q6), item(MC, stem, ["Alpha", "Beta", "Gamma", "Delta"], ["Alpha"])])
-        files["non_cc_assessments/gq5.xml.qti"] = quiz("gq5", "Spread quiz", [item(*self.Q6)])
+        for k, q in enumerate(questions):
+            files[f"non_cc_assessments/gv{k}.xml.qti"] = bank(f"gv{k}", f"Spread {k}", [item(*q)])
+        files["non_cc_assessments/gq5.xml.qti"] = quiz("gq5", "Spread quiz", [item(*q) for q in questions])
+        report, _ = self.run_files(files)
+        card = self.card(report, "Spread quiz")
+        self.assertIn("Every question is in a bank, spread over 6 banks:", card)
+        self.assertIn("and 1 more bank (1).", card)
+        summary = card[card.index("<p>Every"):]
+        self.assertEqual(summary[:summary.index("</p>")].count("<strong>Spread "), 5)
+        # every bank is still named beside its question
+        self.assertIn("Show which banks hold each question", card)
+        self.assertEqual(card[card.index("<details>"):].count("Spread "), 6)
+
+    def test_action_plan(self):
+        files = self.course()
+        files["non_cc_assessments/gq4.xml.qti"] = quiz("gq4", "Final copy", [item(*self.Q3)])
         path = self.export(files)
-        out = os.path.join(self.dir, "report.html")
-        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out]), \
+        out, plan_path = os.path.join(self.dir, "report.html"), os.path.join(self.dir, "plan.xlsx")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out, "--plan", plan_path]), \
                 contextlib.redirect_stdout(io.StringIO()):
             qd.main()
-        with open(out, encoding="utf-8") as f:
-            card = self.card(f.read(), "Spread quiz")
-        # no bank holds it alone and none is called safe, so three are named and the rest counted
-        start = card.index("only in banks no quiz links to")
-        note = card[start:card.index("</p>", start)]
-        self.assertEqual(note.count("Spread "), 3)
-        self.assertIn("and 2 other banks, listed with each question below", note)
-        # the question list still names all five
-        self.assertEqual(card[card.index("<details>"):].count("Spread "), 5)
+        from openpyxl import load_workbook
+        wb = load_workbook(plan_path)
+        self.assertEqual(wb.sheetnames, ["How to use", "Quizzes", "Banks", "Questions"])
+        rows = lambda name: [dict(zip(next(wb[name].iter_rows(values_only=True)), r))
+                             for r in list(wb[name].iter_rows(values_only=True))[1:]]
+        quizzes = {r["Quiz"]: r for r in rows("Quizzes")}
+        # Final copy has the same question as an Old final bank: swap for a question group (step 1)
+        self.assertEqual(quizzes["Final copy"]["Step"], 1)
+        self.assertRegex(quizzes["Final copy"]["Bank"], r"^Old final #\d+$")
+        self.assertIn("picks all 1 from the bank", quizzes["Final copy"]["What to do"])
+        # the Fallacies quiz's question is in Extra, which holds one more: step 2
+        self.assertEqual(quizzes["Fallacies quiz"]["Step"], 2)
+        self.assertIn("which has 2", quizzes["Fallacies quiz"]["What to do"])
+        # Old pool has a question in no bank and one only reworded: step 4, and both are listed
+        self.assertEqual(quizzes["Old pool"]["Step"], 4)
+        self.assertEqual([r["Step"] for r in rows("Quizzes")], sorted(r["Step"] for r in rows("Quizzes")))
+        questions = [(r["Quiz"], r["Where it is"], r["Question"]) for r in rows("Questions")]
+        self.assertIn(("Old pool", "In no bank", self.Q6[1]), questions)
+        self.assertIn(("Old pool", "Reworded version in Extra", self.Q5_REWORDED[1]), questions)
+        # banks: the one Final copy will draw from is kept; its twin, whose question two quizzes hold, can go
+        banks = rows("Banks")
+        drawn = quizzes["Final copy"]["Bank"]
+        self.assertEqual(next(r for r in banks if r["Bank"] == drawn)["Ready to delete"], "no")
+        twin = next(r for r in banks if r["Bank"].startswith("Old final") and r["Bank"] != drawn)
+        self.assertEqual(twin["Ready to delete"], "yes")
+        self.assertIn("Final copy", twin["Why it is safe"])
+
+    def test_plan_holds_a_bank_only_this_quiz_vouches_for(self):
+        files = self.course()  # Old pool alone holds Q3, the only question of both Old final banks
+        path = self.export(files)
+        questions, _, _, containers = qd.collect_questions([path])
+        usage, _, _ = qd.find_bank_usage(questions, containers)
+        variants = qd.build_variants(questions)
+        clusters, roots, _ = qd.find_version_clusters(variants, 85.0)
+        qd.find_duplicate_containers(variants, roots, containers=containers)
+        audit = qd.check_orphan_banks(variants, roots, containers, usage)
+        cluster_of = {id(v): n for n, group in enumerate(clusters, 1) for v in group}
+        coverage = qd.quiz_coverage(variants, containers, cluster_of, audit)
+        sizes = {k: held for k, (held, _, _) in qd.bank_spread(variants, [b.bank for b in audit], cluster_of).items()}
+        plan = qd.build_plan(variants, coverage, audit, sizes)
+        old_final = [r for r in plan["banks"] if r["bank"].startswith("Old final")]
+        self.assertEqual([r["ready"] for r in old_final], ["wait", "wait"])
+        self.assertIn("Wait: Old pool has the only other copy", old_final[0]["before"])
+        self.assertIn("Keep Old final", next(r for r in plan["quizzes"] if r["quiz"] == "Old pool")["keep"])
 
     def test_bank_table_shows_distinct_count_when_it_differs(self):
         files = self.course()
