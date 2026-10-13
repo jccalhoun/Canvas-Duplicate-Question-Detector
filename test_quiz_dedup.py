@@ -1545,6 +1545,59 @@ class QuizCoverageCheck(ExportCase):
         self.assertIn("Show which banks hold each question", card)
         self.assertEqual(card[card.index("<details>"):].count("Spread "), 6)
 
+    def test_action_plan(self):
+        files = self.course()
+        files["non_cc_assessments/gq4.xml.qti"] = quiz("gq4", "Final copy", [item(*self.Q3)])
+        path = self.export(files)
+        out, plan_path = os.path.join(self.dir, "report.html"), os.path.join(self.dir, "plan.xlsx")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out, "--plan", plan_path]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        from openpyxl import load_workbook
+        wb = load_workbook(plan_path)
+        self.assertEqual(wb.sheetnames, ["How to use", "Quizzes", "Banks", "Questions"])
+        rows = lambda name: [dict(zip(next(wb[name].iter_rows(values_only=True)), r))
+                             for r in list(wb[name].iter_rows(values_only=True))[1:]]
+        quizzes = {r["Quiz"]: r for r in rows("Quizzes")}
+        # Final copy has the same question as an Old final bank: swap for a question group (step 1)
+        self.assertEqual(quizzes["Final copy"]["Step"], 1)
+        self.assertRegex(quizzes["Final copy"]["Bank"], r"^Old final #\d+$")
+        self.assertIn("picks all 1 from the bank", quizzes["Final copy"]["What to do"])
+        # the Fallacies quiz's question is in Extra, which holds one more: step 2
+        self.assertEqual(quizzes["Fallacies quiz"]["Step"], 2)
+        self.assertIn("which has 2", quizzes["Fallacies quiz"]["What to do"])
+        # Old pool has a question in no bank and one only reworded: step 4, and both are listed
+        self.assertEqual(quizzes["Old pool"]["Step"], 4)
+        self.assertEqual([r["Step"] for r in rows("Quizzes")], sorted(r["Step"] for r in rows("Quizzes")))
+        questions = [(r["Quiz"], r["Where it is"], r["Question"]) for r in rows("Questions")]
+        self.assertIn(("Old pool", "In no bank", self.Q6[1]), questions)
+        self.assertIn(("Old pool", "Reworded version in Extra", self.Q5_REWORDED[1]), questions)
+        # banks: the one Final copy will draw from is kept; its twin, whose question two quizzes hold, can go
+        banks = rows("Banks")
+        drawn = quizzes["Final copy"]["Bank"]
+        self.assertEqual(next(r for r in banks if r["Bank"] == drawn)["Ready to delete"], "no")
+        twin = next(r for r in banks if r["Bank"].startswith("Old final") and r["Bank"] != drawn)
+        self.assertEqual(twin["Ready to delete"], "yes")
+        self.assertIn("Final copy", twin["Why it is safe"])
+
+    def test_plan_holds_a_bank_only_this_quiz_vouches_for(self):
+        files = self.course()  # Old pool alone holds Q3, the only question of both Old final banks
+        path = self.export(files)
+        questions, _, _, containers = qd.collect_questions([path])
+        usage, _, _ = qd.find_bank_usage(questions, containers)
+        variants = qd.build_variants(questions)
+        clusters, roots, _ = qd.find_version_clusters(variants, 85.0)
+        qd.find_duplicate_containers(variants, roots, containers=containers)
+        audit = qd.check_orphan_banks(variants, roots, containers, usage)
+        cluster_of = {id(v): n for n, group in enumerate(clusters, 1) for v in group}
+        coverage = qd.quiz_coverage(variants, containers, cluster_of, audit)
+        sizes = {k: held for k, (held, _, _) in qd.bank_spread(variants, [b.bank for b in audit], cluster_of).items()}
+        plan = qd.build_plan(variants, coverage, audit, sizes)
+        old_final = [r for r in plan["banks"] if r["bank"].startswith("Old final")]
+        self.assertEqual([r["ready"] for r in old_final], ["wait", "wait"])
+        self.assertIn("Wait: Old pool has the only other copy", old_final[0]["before"])
+        self.assertIn("Keep Old final", next(r for r in plan["quizzes"] if r["quiz"] == "Old pool")["keep"])
+
     def test_bank_table_shows_distinct_count_when_it_differs(self):
         files = self.course()
         files["non_cc_assessments/gw.xml.qti"] = bank("gw", "Repeats", [item(*self.Q6), item(*self.Q6)])

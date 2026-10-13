@@ -2057,6 +2057,229 @@ def build_json_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
     }
 
 
+# ---------------------------------------------------------------------------
+# Action plan (--plan): a to-do list for moving quiz questions into banks
+# ---------------------------------------------------------------------------
+# question types that usually mean a survey, reflection or assignment rather than
+# a question worth banking
+ASSIGNMENT_TYPES = {"essay_question", "numerical_question", "file_upload_question", "text_only_question"}
+
+PLAN_STEPS = {
+    1: "Swap for a question group",
+    2: "Inside a bigger bank",
+    3: "Spread over banks",
+    4: "Put questions in a bank first",
+}
+
+
+def keep_for_quiz(cov, variants, bank_info):
+    """Banks the bank check calls safe to delete only because this quiz holds
+    the only quiz copy of some of their questions: (export, bank id) keys.
+    Deleting one of them and then changing the quiz loses those questions."""
+    here = (cov.quiz.source_file, cov.quiz.cid)
+    sole = [i for i in cov.in_unlinked
+            if not any(q.source_kind == "quiz" and (q.source_file, q.quiz_id) != here for q in variants[i].occurrences)]
+    return {k for i in sole for k in cov.in_unlinked[i]
+            if k in bank_info and bank_info[k].verdict in (VERDICT_SAFE, VERDICT_COVERED)}
+
+
+def build_plan(variants, coverage, audit, bank_sizes, show_source=False):
+    """The action plan as plain data: {"quizzes": [...], "banks": [...],
+    "questions": [...]}, each a list of row dicts in the order to work
+    through them. `coverage` is quiz_coverage()'s list in report order, so
+    a quiz numbered #12 here is #12 in the report too, and banks are
+    numbered as in the report's bank check."""
+    bank_info = {(b.bank.source_file, b.bank.cid): b for b in audit}
+    bank_number = {(b.bank.source_file, b.bank.cid): n for n, b in enumerate(audit, 1)}
+    bank_names = Counter((b.bank.source_file, b.bank.title.lower()) for b in audit)
+    quiz_names = Counter((cov.quiz.source_file, cov.quiz.title.lower()) for cov in coverage)
+
+    def bank_label(key):
+        b = bank_info.get(key)
+        if b is None:
+            return key[1]
+        label = b.bank.title.strip()
+        if bank_names[(key[0], b.bank.title.lower())] > 1:
+            label += f" #{bank_number[key]}"
+        return label + (f" [{key[0]}]" if show_source else "")
+
+    def listing(items, limit=4):
+        items = list(items)
+        shown = ", ".join(items[:limit])
+        return shown + (f" and {len(items) - limit} more" if len(items) > limit else "")
+
+    quiz_rows, question_rows, holds, uses = [], [], {}, {}
+    for n, cov in enumerate(coverage, 1):
+        c = cov.quiz
+        label = c.title.strip()
+        if quiz_names[(c.source_file, c.title.lower())] > 1:
+            label += f" #{n}"
+        if show_source:
+            label += f" [{c.source_file}]"
+        d, in_bank = cov.distinct, len(cov.banks)
+        cover = cov.cover(bank_sizes)
+        spread = listing([f"{bank_label(k)} ({added})" for k, added in cover], 6)
+        if in_bank == d and len(cover) == 1:
+            key = cover[0][0]
+            size = bank_sizes.get(key, 0)
+            if size <= d:
+                step = 1
+                action = (f"Delete the quiz's questions and add a question group that picks all {d} "
+                          f"from the bank.")
+            else:
+                step = 2
+                action = (f"All {d} questions are in this bank, which has {size}. Either add a question group "
+                          f"that picks {d} from it (students get a random {d}), or copy these {d} into a new "
+                          f"bank and pick all {d} from that.")
+            banks = bank_label(key)
+            uses.setdefault(key, []).append(label)
+        elif in_bank == d:
+            step = 3
+            action = (f"Its questions are in {plural(len(cover), 'bank')}. Copy them into one new bank, then "
+                      f"replace them with a question group that picks all {d}.")
+            banks = spread
+        else:
+            step = 4
+            others = d - in_bank
+            action = ((f"{in_bank} of {d} questions are in a bank. Put the other {others} into a bank first"
+                       if in_bank else f"None of its {d} questions are in a bank. Put them into a bank first")
+                      + " (they are on the Questions tab), then handle it like steps 1 to 3.")
+            outside = [variants[i].rep.question_type for i in list(cov.modified) + cov.missing]
+            if outside and all(t in ASSIGNMENT_TYPES for t in outside):
+                action += (" Those are all essay, numerical or similar questions, so this may be an "
+                           "assignment you would rather leave as a quiz.")
+            banks = spread if in_bank else ""
+            for i, (group, keys) in cov.modified.items():
+                question_rows.append((label, i, f"Reworded version in {listing(bank_label(k) for k in keys)}",
+                                      f"Modified questions, group {group}"))
+            for i in cov.missing:
+                question_rows.append((label, i, "In no bank", ""))
+        keep = sorted(keep_for_quiz(cov, variants, bank_info), key=lambda k: bank_label(k).lower())
+        for k in keep:
+            holds.setdefault(k, []).append(label)
+        quiz_rows.append({
+            "step": step, "what": PLAN_STEPS[step], "quiz": label, "questions": d,
+            "published": {True: "yes", False: "no"}.get(c.published, ""),
+            "action": action, "banks": banks,
+            "keep": (f"Keep {listing(bank_label(k) for k in keep)}: this quiz has the only other copy of some "
+                     "of their questions." if keep else ""),
+        })
+    quiz_rows.sort(key=lambda r: (r["step"], r["quiz"].lower()))
+
+    bank_rows = []
+    for b in audit:
+        if b.verdict not in (VERDICT_SAFE, VERDICT_COVERED):
+            continue
+        key = (b.bank.source_file, b.bank.cid)
+        places = sorted({t.strip() for f in b.findings if f.coverage == "exact" for t in f.places}, key=str.lower)
+        why = f"Every question is also in use in {listing(places)}." if places else "Every question is in use elsewhere."
+        before = ""
+        if b.verdict == VERDICT_COVERED:
+            relied = [bank_label((o.bank.source_file, o.bank.cid)) for o in b.relies_on]
+            why = ("Every question is in use elsewhere or in a bank kept as the one copy"
+                   + (f" ({listing(relied)})" if relied else "") + ".")
+            if relied:
+                before = f"Delete only while you keep {listing(relied)}."
+        waiting, drawn = holds.get(key, []), uses.get(key, [])
+        ready = "yes"
+        if drawn:
+            ready = "no"
+            before = (f"Keep: the plan for {listing(drawn)} uses this bank for a question group (step 1 or 2 on "
+                      "the Quizzes tab). Once it does, the bank is in use and drops off this list.")
+        elif waiting:
+            ready = "wait"
+            before = (f"Wait: {listing(waiting)} {'has' if len(waiting) == 1 else 'have'} the only other copy "
+                      "of some of its questions. Change that quiz first, then rerun and check again.")
+        bank_rows.append({
+            "ready": ready, "bank": bank_label(key), "questions": b.bank.item_count,
+            "status": b.status, "verdict": VERDICT_LABELS[b.verdict], "why": why, "before": before,
+        })
+    bank_rows.sort(key=lambda r: (["yes", "wait", "no"].index(r["ready"]), r["bank"].lower()))
+
+    questions = []
+    for label, i, status, where in question_rows:
+        q = variants[i].rep
+        questions.append({
+            "quiz": label, "type": type_label(q.question_type), "status": status, "question": q.text,
+            "choices": " | ".join(q.choices), "answer": " | ".join(q.correct), "report": where,
+        })
+    return {"quizzes": quiz_rows, "banks": bank_rows, "questions": questions}
+
+
+def write_plan(path, plan, sources):
+    """Write the action plan to an Excel file with a tab each for how to use
+    it, the quizzes, the banks safe to delete, and the questions to put in a
+    bank."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+    except ImportError:
+        sys.exit("--plan needs the openpyxl package: pip install openpyxl")
+    wb = Workbook()
+    readme = wb.active
+    readme.title = "How to use"
+    steps = Counter(r["step"] for r in plan["quizzes"])
+    ready = sum(1 for r in plan["banks"] if r["ready"] == "yes")
+    lines = [
+        ("Plan for moving quiz questions into banks", True),
+        (f"Made {date.today().isoformat()} from {', '.join(sources)}.", False),
+        ("", False),
+        ("1. Work through the Quizzes tab from the top. Steps are in the order to do them; tick Done as you go.", False),
+        (f"   Step 1 ({steps[1]}): the quiz has the same questions as a bank. Replace them with a question "
+         "group that picks all of them from that bank.", False),
+        (f"   Step 2 ({steps[2]}): the questions are all in one bigger bank. Draw at random from it, or copy "
+         "them into a bank of their own.", False),
+        (f"   Step 3 ({steps[3]}): the questions are spread over several banks. Copy them into one new bank "
+         "and use one question group.", False),
+        (f"   Step 4 ({steps[4]}): some questions are in no bank, or only as a reworded version. They are "
+         "listed on the Questions tab.", False),
+        ("2. Respect the Keep column. It names banks this quiz depends on: delete one and change the quiz, "
+         "and those questions are gone.", False),
+        (f"3. The Banks tab lists banks the bank check calls safe to delete. Delete only rows marked yes ({ready} "
+         "now). Wait means a quiz you have not changed yet holds the only other copy of some of its questions; "
+         "no means the plan has a quiz draw from it.", False),
+        ("4. Banks not on the Banks tab hold questions found nowhere else, or need a look first. See the "
+         "report's bank check.", False),
+        ("5. After a round of changes, export the course again and rerun with --plan. Finished work drops off "
+         "and the plan gets shorter.", False),
+    ]
+    for text, bold in lines:
+        readme.append([text])
+        if bold:
+            readme.cell(readme.max_row, 1).font = Font(bold=True, size=13)
+    readme.column_dimensions["A"].width = 120
+
+    head_font, head_fill = Font(bold=True), PatternFill("solid", fgColor="DDE6F0")
+    wrap = Alignment(wrap_text=True, vertical="top")
+
+    def sheet(title, columns, rows):
+        ws = wb.create_sheet(title)
+        ws.append([name for name, _, _ in columns])
+        for cell in ws[1]:
+            cell.font, cell.fill = head_font, head_fill
+        for row in rows:
+            ws.append([row.get(key, "") if key else "" for _, key, _ in columns])
+        for n, (_, _, width) in enumerate(columns, 1):
+            ws.column_dimensions[ws.cell(1, n).column_letter].width = width
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = wrap
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        return ws
+
+    sheet("Quizzes", [("Step", "step", 6), ("What", "what", 22), ("Quiz", "quiz", 34), ("Questions", "questions", 10),
+                      ("Published", "published", 10), ("What to do", "action", 60), ("Bank", "banks", 40),
+                      ("Keep", "keep", 40), ("Done", None, 8)], plan["quizzes"])
+    sheet("Banks", [("Ready to delete", "ready", 9), ("Bank", "bank", 40), ("Questions", "questions", 10),
+                    ("Status", "status", 11), ("Verdict", "verdict", 20), ("Why it is safe", "why", 60),
+                    ("Before deleting", "before", 50), ("Done", None, 8)], plan["banks"])
+    sheet("Questions", [("Quiz", "quiz", 30), ("Type", "type", 22), ("Where it is", "status", 30),
+                        ("Question", "question", 60), ("Choices", "choices", 45), ("Answer", "answer", 30),
+                        ("In the report", "report", 20), ("Done", None, 8)], plan["questions"])
+    wb.save(path)
+
+
 def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, same_choice_groups, repeated,
                       identical_containers, container_overlaps, unresolved, threshold,
                       total_questions, total_quizzes, total_banks, ctx):
@@ -2603,12 +2826,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                          f"{plural(len(cov.missing), 'question')} {are(len(cov.missing))} in no bank.")
 
         # ---- a bank the bank check calls safe to delete only because this quiz has copies of its questions
-        sole_copy = [i for i in cov.in_unlinked
-                     if not any(q.source_kind == "quiz" and (q.source_file, q.quiz_id) != here
-                                for q in variants[i].occurrences)]
-        safe = sorted({k for i in sole_copy for k in cov.in_unlinked[i]
-                       if bank_info.get(k) and bank_info[k].verdict in (VERDICT_SAFE, VERDICT_COVERED)},
-                      key=lambda k: bank_titles.get(k, "").lower())
+        safe = sorted(keep_for_quiz(cov, variants, bank_info), key=lambda k: bank_titles.get(k, "").lower())
         caution = ""
         if safe:
             caution = (f"<p class='coverage-warn'>Keep {name_list(safe)} if you change this quiz. The bank check "
@@ -2880,6 +3098,10 @@ def main():
     ap.add_argument("-o", "--output", default="quiz_duplicate_report.html", help="Output HTML report path")
     ap.add_argument("--json", metavar="PATH",
                     help="Also write the findings to PATH as JSON, with the same sections as the report.")
+    ap.add_argument("--plan", metavar="PATH",
+                    help="Also write an action plan to PATH (an .xlsx file): what to do with each quiz to get its "
+                         "questions into banks, which banks are safe to delete, and which questions are in no bank. "
+                         "Needs openpyxl.")
     ap.add_argument("-t", "--threshold", type=float, default=85.0,
                     help="How similar the stem or the choices must be to call two questions "
                          "versions of each other, 0-100 (default 85). Lower finds heavier "
@@ -3064,6 +3286,12 @@ def main():
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
         print(f"JSON written to {args.json}")
+    if args.plan:
+        sizes = {key: held for key, (held, _, _) in bank_spread(variants, [b.bank for b in bank_audit],
+                                                                 cluster_of).items()}
+        plan = build_plan(variants, coverage, bank_audit, sizes, ctx["show_source"])
+        write_plan(args.plan, plan, export_labels(args.sources))
+        print(f"Action plan written to {args.plan}")
 
 
 if __name__ == "__main__":

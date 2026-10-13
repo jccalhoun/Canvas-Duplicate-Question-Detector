@@ -25,6 +25,8 @@ It is meant for courses that have been copied forward for years and have collect
 pip install rapidfuzz numpy
 ```
 
+The action plan (`--plan`) also needs [openpyxl](https://openpyxl.readthedocs.io/): `pip install openpyxl`.
+
 ## Getting an export from Canvas
 
 1. In the course, go to **Settings**, then **Export Course Content**.
@@ -50,6 +52,7 @@ python3 quiz_dedup.py fall.imscc spring.imscc -o report.html
 | `sources` | (required) | One or more `.imscc` or `.zip` exports, or folders of already-extracted exports |
 | `-o`, `--output` | `quiz_duplicate_report.html` | Where to write the report |
 | `--json PATH` | (none) | Also write the findings to `PATH` as JSON |
+| `--plan PATH` | (none) | Also write an action plan to `PATH`, an `.xlsx` file (see *Action plan*) |
 | `-t`, `--threshold` | `85` | How similar (0 to 100) the stem or the choices must be for two questions to count as versions of each other |
 | `--word-overlap` | `60` | When two stems are worded differently, how much of their distinctive wording (0 to 100) they must share to count as the same question |
 | `--container-overlap` | `80` | List a quiz or bank as mostly contained in another when at least this percent of its questions are also there |
@@ -180,6 +183,26 @@ A **Keep X** note appears when the bank check calls a bank safe to delete only b
 Each card can be expanded to show the reworded questions (each linked to its group in *Modified questions*, where the wording diff is), the questions in no bank, and which banks hold each question.
 
 The heading of each card gives the question count. Distinct questions are shown too when the quiz repeats a question. Quizzes that share a title are numbered (`#29`) and show their first question, as same-named banks do. A question Canvas could not export is written with the type `Error` and only its text. The report says so wherever it shows one. Quizzes that draw all their questions from banks are not listed. Questions removed with `--exclude-type` are not counted. Cards are sorted by title and work with the title filter.
+
+## Action plan
+
+```
+python3 quiz_dedup.py export.imscc -o report.html --plan plan.xlsx
+```
+
+The report answers "what is duplicated where". The action plan answers "what do I do next" when the goal is to get quiz questions into banks. It is a spreadsheet you can open in Excel or Google Sheets, with one row per decision and a Done column to tick:
+
+- **Quizzes**: one row per quiz that has questions of its own, in the order to work through them.
+  - **Step 1, swap for a question group**: the quiz has the same questions as a bank. Delete its questions and add a question group that picks all of them from that bank.
+  - **Step 2, inside a bigger bank**: every question is in one bank that has more. Draw at random from it, or copy the questions into a bank of their own.
+  - **Step 3, spread over banks**: copy the questions into one new bank and use one question group.
+  - **Step 4, put questions in a bank first**: some questions are in no bank, or only as a reworded version. A quiz whose missing questions are all essay, numerical and similar types is flagged as possibly an assignment you would rather leave alone.
+
+  The **Keep** column names banks the quiz depends on: the bank check calls them safe to delete only because this quiz has the only other copy of some of their questions.
+- **Banks**: the banks the bank check calls safe to delete, with why, and whether to go ahead. **yes** means delete it. **wait** means a quiz you have not changed yet holds the only other copy of some of its questions. **no** means the plan has a quiz draw from it, so it will be in use.
+- **Questions**: every question from a step 4 quiz that is in no bank, or only reworded in one, with its type, choices and answer, ready to add to a bank.
+
+Quizzes and banks that share a title carry the same `#` number as in the report. Nothing is changed in Canvas: the plan is a checklist for doing the work by hand. After a round of changes, export the course again and rerun. Finished work drops off and the plan gets shorter.
 
 ## Duplicate quizzes and banks
 
