@@ -1619,6 +1619,90 @@ class QuizCoverageCheck(ExportCase):
         self.assertEqual(qd.type_label(MC), MC)
 
 
+class Comparison(ExportCase):
+    """Side-by-side comparison of two quizzes or banks: in the report under
+    each "mostly contained" match, and on its own with --compare."""
+    Q1, Q2, Q2_TWEAKED, Q3, Q4, Q5 = (OrphanBanks.Q1, OrphanBanks.Q2, OrphanBanks.Q2_TWEAKED,
+                                      OrphanBanks.Q3, OrphanBanks.Q4, OrphanBanks.Q5)
+    Q6 = QuizCoverageCheck.Q6
+
+    def course(self):
+        a = [self.Q1, self.Q2, self.Q3, self.Q6, self.Q4]
+        b = [self.Q1, self.Q2_TWEAKED, self.Q3, self.Q6, self.Q5]
+        return {
+            "non_cc_assessments/ga.xml.qti": bank("ga", "Pool A", [item(*q) for q in a]),
+            "non_cc_assessments/gq.xml.qti": quiz("gq", "Quiz B", [item(*q) for q in b]),
+            "non_cc_assessments/gx.xml.qti": quiz("gx", "Twin", [item(*self.Q4)]),
+            "non_cc_assessments/gy.xml.qti": quiz("gy", "Twin", [item(*self.Q5)]),
+        }
+
+    def run_main(self, *extra):
+        path = self.export(self.course())
+        out = os.path.join(self.dir, "report.html")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out, *extra]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        return out
+
+    def test_compare_containers_sorts_every_question(self):
+        path = self.export(self.course())
+        questions, _, _, containers = qd.collect_questions([path])
+        variants = qd.build_variants(questions)
+        clusters, roots, _ = qd.find_version_clusters(variants, 85.0)
+        qd.find_duplicate_containers(variants, roots, containers=containers)
+        cluster_of = {id(v): n for n, group in enumerate(clusters, 1) for v in group}
+        a = next(c for c in containers if c.cid == "ga")
+        b = next(c for c in containers if c.cid == "gq")
+        same, reworded, only_a, only_b = qd.compare_containers(a, b, variants, cluster_of)
+        stem = lambda i: variants[i].rep.text
+        self.assertEqual(sorted(stem(i) for i in same), sorted([self.Q1[1], self.Q3[1], self.Q6[1]]))
+        ((i, j),) = reworded
+        self.assertEqual((stem(i), variants[i].rep.choices), (self.Q2[1], self.Q2[2]))
+        self.assertEqual(variants[j].rep.choices, self.Q2_TWEAKED[2])
+        self.assertEqual([stem(i) for i in only_a], [self.Q4[1]])
+        self.assertEqual([stem(i) for i in only_b], [self.Q5[1]])
+
+    def test_report_has_a_side_by_side_under_mostly_contained(self):
+        with open(self.run_main(), encoding="utf-8") as f:
+            report = f.read()
+        section = report[report.index('id="mostly-contained"'):report.index('id="modified"')]
+        self.assertIn("Compare side by side", section)
+        self.assertIn("<strong>3</strong> the same &middot; <strong>1</strong> reworded &middot; "
+                      "<strong>1</strong> only in A &middot; <strong>1</strong> only in B", section)
+        self.assertIn("class='compare-grid'", section)
+        self.assertIn("The use of time to <del>communicate</del> <ins>send messages</ins>", section)
+
+    def test_long_lists_are_counted_in_the_report(self):
+        with mock.patch.object(qd, "COMPARE_LIMIT", 0):
+            with open(self.run_main(), encoding="utf-8") as f:
+                report = f.read()
+        section = report[report.index('id="mostly-contained"'):report.index('id="modified"')]
+        self.assertIn("1 reworded question. Run the script with --compare to see them all.", section)
+        self.assertNotIn("class='qcard'", section)
+
+    def test_compare_option_writes_a_page(self):
+        page = os.path.join(self.dir, "cmp.html")
+        out = self.run_main("--compare", "pool a", "quiz", "--compare-output", page)
+        self.assertFalse(os.path.exists(out))  # compare mode writes only the comparison
+        with open(page, encoding="utf-8") as f:
+            html_text = f.read()
+        self.assertIn("A is [bank] <strong>Pool A</strong> (5 questions); B is [quiz] <strong>Quiz B</strong>",
+                      html_text)
+        self.assertIn(".compare-grid", html_text)
+
+    def test_compare_option_names_ambiguous_titles(self):
+        with self.assertRaises(SystemExit) as stop:
+            self.run_main("--compare", "Twin", "Pool A")
+        self.assertIn("matches more than one", str(stop.exception))
+        self.assertIn("gx", str(stop.exception))
+        with self.assertRaises(SystemExit) as stop:
+            self.run_main("--compare", "nothing like this", "Pool A")
+        self.assertIn("no quiz or bank matches", str(stop.exception))
+        page = os.path.join(self.dir, "cmp.html")
+        self.run_main("--compare", "gx", "gy", "--compare-output", page)
+        self.assertTrue(os.path.exists(page))
+
+
 class Scoring(unittest.TestCase):
     def test_numbers_keep_their_sign_and_shape(self):
         forms = ["5", "-5", ".5", "1.5", "15", "1-5", "\u22125"]

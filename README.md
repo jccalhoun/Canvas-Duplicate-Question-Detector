@@ -53,6 +53,8 @@ python3 quiz_dedup.py fall.imscc spring.imscc -o report.html
 | `-o`, `--output` | `quiz_duplicate_report.html` | Where to write the report |
 | `--json PATH` | (none) | Also write the findings to `PATH` as JSON |
 | `--plan PATH` | (none) | Also write an action plan to `PATH`, an `.xlsx` file (see *Action plan*) |
+| `--compare A B` | (none) | Instead of the report, compare two quizzes or banks side by side (see *Comparing two quizzes or banks*) |
+| `--compare-output PATH` | `comparison.html` | Where `--compare` writes its page |
 | `-t`, `--threshold` | `85` | How similar (0 to 100) the stem or the choices must be for two questions to count as versions of each other |
 | `--word-overlap` | `60` | When two stems are worded differently, how much of their distinctive wording (0 to 100) they must share to count as the same question |
 | `--container-overlap` | `80` | List a quiz or bank as mostly contained in another when at least this percent of its questions are also there |
@@ -183,6 +185,25 @@ A **Keep X** note appears when the bank check calls a bank safe to delete only b
 Each card can be expanded to show the reworded questions (each linked to its group in *Modified questions*, where the wording diff is), the questions in no bank, and which banks hold each question.
 
 The heading of each card gives the question count. Distinct questions are shown too when the quiz repeats a question. Quizzes that share a title are numbered (`#29`) and show their first question, as same-named banks do. A question Canvas could not export is written with the type `Error` and only its text. The report says so wherever it shows one. Quizzes that draw all their questions from banks are not listed. Questions removed with `--exclude-type` are not counted. Cards are sorted by title and work with the title filter.
+
+## Comparing two quizzes or banks
+
+Under each match in *Mostly contained in another*, **Compare side by side** opens a comparison of the two:
+
+- a count of the questions that are the same, reworded, only in A, and only in B
+- each reworded question in two columns, A's version on the left and B's on the right, with B's added and removed wording marked against A's and badges saying what changed
+- the questions only one side has, in their own column
+- the questions that are the same, as a list you can expand
+
+Use it to decide which of two banks to keep and edit, and which to delete. In the report, a list longer than 25 questions is counted rather than shown, to keep the report small.
+
+To compare any two quizzes or banks, with every list shown in full:
+
+```
+python3 quiz_dedup.py export.imscc --compare "Chapter 3 Listening pool" "OLD Chapter 3 listening pool"
+```
+
+Name each one by its title or a unique part of it. When a name matches more than one quiz or bank, the script lists them with their export ids, and you can pass an id instead. The comparison is written to `comparison.html` (change it with `--compare-output`), and no report is written in this mode. Only questions stored in each quiz or bank are compared, not ones a quiz draws from a bank.
 
 ## Action plan
 
