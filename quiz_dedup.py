@@ -1830,7 +1830,7 @@ def render_choices(q, ref=None):
     return out
 
 
-def render_variant(variant, ctx, heading="", ref=None, badges=""):
+def render_variant(variant, ctx, heading="", ref=None, badges="", locations=True):
     q = variant.rep
     stem = word_diff(ref.rep.text, q.text) if ref is not None else esc(q.text)
     head = f"<div class='vhead'>{heading}{badges}</div>" if heading or badges else ""
@@ -1848,7 +1848,7 @@ def render_variant(variant, ctx, heading="", ref=None, badges=""):
       <div class="qmeta">{esc(type_label(q.question_type))}{points}</div>
       <div class="qtext">{stem}</div>
       {render_choices(q, ref.rep if ref is not None else None)}
-      {render_locations(variant, ctx)}
+      {render_locations(variant, ctx) if locations else ""}
     </div>
     """
 
@@ -1891,6 +1891,119 @@ def describe_change(ref, v):
         for name, detail, cls in tags
     )
     return html_tags, keyed
+
+
+# in the report, a side-by-side list longer than this is counted instead of shown
+COMPARE_LIMIT = 25
+
+
+def compare_containers(a, b, variants, cluster_of):
+    """What two quizzes or banks have in common, by the questions stored in
+    them (not ones a quiz draws from a bank). Returns (same, reworded,
+    only_a, only_b): variant indexes in both; (index in a, index in b) pairs
+    that are versions of one question (same modified-question group,
+    paired by closest wording); and the rest of each side."""
+    same = a.members & b.members
+    rest_a, rest_b = sorted(a.members - b.members), set(b.members - a.members)
+    group = lambda i: cluster_of.get(id(variants[i]))
+    reworded, only_a = [], []
+    for i in rest_a:
+        options = [j for j in rest_b if group(i) is not None and group(j) == group(i)]
+        if not options:
+            only_a.append(i)
+            continue
+        j = max(options, key=lambda j: (fuzz.ratio(variants[i].stem, variants[j].stem), -j))
+        reworded.append((i, j))
+        rest_b.discard(j)
+    return sorted(same), reworded, only_a, sorted(rest_b)
+
+
+def render_comparison(a, b, ctx, limit=None):
+    """Side-by-side view of two quizzes or banks: a summary line, reworded
+    questions next to each other (b's version diffed against a's), and the
+    questions only one of them has. With `limit`, a list longer than that
+    is counted instead of shown, to keep the report small."""
+    variants = ctx["variants"]
+    same, reworded, only_a, only_b = compare_containers(a, b, variants, ctx.get("cluster_of", {}))
+    name = lambda c: f"[{esc(kind_label(c.kind, c.engine))}] <strong>{esc(c.title)}</strong>"
+    head = "<div class='col-head'>A: {}</div><div class='col-head'>B: {}</div>".format(name(a), name(b))
+    parts = [f"<p class='compare-sum'>A is {name(a)} ({plural(a.size, 'question')}); "
+             f"B is {name(b)} ({plural(b.size, 'question')}).<br>"
+             f"<strong>{len(same)}</strong> the same &middot; <strong>{len(reworded)}</strong> reworded &middot; "
+             f"<strong>{len(only_a)}</strong> only in A &middot; <strong>{len(only_b)}</strong> only in B</p>"]
+    too_many = lambda n: limit is not None and n > limit
+    hint = "Run the script with --compare to see them all."
+
+    if reworded:
+        if too_many(len(reworded)):
+            parts.append(f"<p class='src'>{plural(len(reworded), 'reworded question')}. {hint}</p>")
+        else:
+            cells = ""
+            for i, j in reworded:
+                badges, _ = describe_change(variants[i], variants[j])
+                cells += (render_variant(variants[i], ctx, heading="A", locations=False)
+                          + render_variant(variants[j], ctx, heading="B ", ref=variants[i], badges=badges,
+                                           locations=False))
+            parts.append(f"<h4>Reworded: B's wording is marked against A's</h4><div class='compare-grid'>{head}{cells}</div>")
+
+    if only_a or only_b:
+        def column(idxs, other):
+            if not idxs:
+                return f"<div class='gap'>Nothing that {other} lacks.</div>"
+            if too_many(len(idxs)):
+                return f"<div class='gap'>{plural(len(idxs), 'question')}. {hint}</div>"
+            return "<div>" + "".join(render_variant(variants[i], ctx, locations=False) for i in idxs) + "</div>"
+        parts.append(f"<h4>Only on one side</h4><div class='compare-grid'>{head}"
+                     f"{column(only_a, 'B')}{column(only_b, 'A')}</div>")
+
+    if same:
+        if too_many(len(same)):
+            parts.append(f"<p class='src'>{plural(len(same), 'question')} the same on both sides.</p>")
+        else:
+            items = "".join(f"<li>{esc(variants[i].rep.text)}</li>" for i in same)
+            parts.append(f"<details><summary>Show the {plural(len(same), 'question')} that are the same"
+                         f"</summary><ul class='same-list'>{items}</ul></details>")
+    if a.draws or a.picks or b.draws or b.picks:
+        parts.append("<p class='src'>Only questions stored in each one are compared, not ones a quiz "
+                     "draws from a bank.</p>")
+    return "".join(parts)
+
+
+def find_container(text, containers):
+    """The quiz or bank a --compare argument names: an export id, an exact
+    title (ignoring case and extra spaces), or failing that a unique part of
+    a title. Exits with the candidates when it is ambiguous."""
+    norm = lambda t: WS_RE.sub(" ", t).strip().lower()
+    want = norm(text)
+    for test in (lambda c: c.cid == text, lambda c: norm(c.title) == want, lambda c: want in norm(c.title)):
+        found = [c for c in containers if test(c)]
+        if len(found) == 1:
+            return found[0]
+        if len(found) > 1:
+            listing = "\n".join(f"  {c.cid}  [{kind_label(c.kind, c.engine)}] {c.title} "
+                                 f"({plural(c.size, 'question')}){'  ' + c.source_file if len({x.source_file for x in found}) > 1 else ''}"
+                                 for c in sorted(found, key=lambda c: (c.title.lower(), c.cid)))
+            sys.exit(f"--compare: {text!r} matches more than one quiz or bank. Pass the id instead:\n{listing}")
+    sys.exit(f"--compare: no quiz or bank matches {text!r}.")
+
+
+def build_comparison_page(a, b, ctx):
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compare {esc(a.title)} and {esc(b.title)}</title>
+<style>{REPORT_CSS}</style>
+</head>
+<body>
+  <h1>Comparing two {'quizzes' if a.kind == b.kind == 'quiz' else 'banks' if a.kind == b.kind else 'question sets'}</h1>
+  {render_comparison(a, b, ctx)}
+  <p class="summary">Generated {date.today().isoformat()}. <ins>Added</ins> and <del>removed</del> wording in B is
+  marked against A. <span class="key">&#10003;</span> marks the credited answer.</p>
+</body>
+</html>
+"""
 
 
 def order_clusters(groups):
@@ -2280,6 +2393,101 @@ def write_plan(path, plan, sources):
     wb.save(path)
 
 
+REPORT_CSS = """
+  :root {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #666; --border: #e0e0e0;
+    --exact-bg: #fff4f4; --exact-border: #e57373;
+    --near-bg: #fff9e6; --near-border: #e0c34a;
+    --warn-bg: #fff0e0; --warn-border: #e08a3d;
+    --card-bg: #fafafa;
+    --ins-bg: #d4f5d4; --ins-fg: #14501a; --del-bg: #fbdada; --del-fg: #8a1f1f;
+    --alert: #c62828; --key: #2e7d32; --review-fg: #8a6400;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1a1a1a; --fg: #eee; --muted: #aaa; --border: #333;
+      --exact-bg: #2a1a1a; --exact-border: #a54a4a;
+      --near-bg: #2a260f; --near-border: #a5904a;
+      --warn-bg: #2a1f0f; --warn-border: #a5723d;
+      --card-bg: #232323;
+      --ins-bg: #1e4023; --ins-fg: #b9f0bf; --del-bg: #4a2020; --del-fg: #f5b5b5;
+      --alert: #ef6c6c; --key: #7fd087; --review-fg: #e0c34a;
+    }
+  }
+  body { background: var(--bg); color: var(--fg); font-family: -apple-system, Segoe UI, Roboto, sans-serif; max-width: 900px; margin: 0 auto; padding: 24px 16px 80px; line-height: 1.5; }
+  h1 { font-size: 1.5rem; }
+  h2 { margin-top: 2.5rem; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 0.95rem; margin: 0 0 8px; }
+  .top { float: right; font-size: 0.75rem; font-weight: 400; margin-top: 0.6em; }
+  .toc { border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; font-size: 0.9rem; }
+  .toc ul { margin: 6px 0 0; padding-left: 20px; }
+  a { color: inherit; }
+  h2, h3[id], p[id], .match-group[id] { scroll-margin-top: 80px; }
+  [hidden] { display: none !important; }
+  .filter-bar { position: sticky; top: 0; z-index: 5; background: var(--bg); padding: 10px 0 8px;
+                 border-bottom: 1px solid var(--border); margin-bottom: 1rem; }
+  .filter-row { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+  .filter-row input[type=search] { flex: 1 1 260px; min-width: 0; font: inherit; padding: 6px 10px;
+                                     border: 1px solid var(--border); border-radius: 6px; background: var(--card-bg); color: var(--fg); }
+  .filter-row label { font-size: 0.85rem; color: var(--muted); white-space: nowrap; }
+  .filter-row button { font: inherit; font-size: 0.85rem; padding: 4px 10px; border: 1px solid var(--border);
+                        border-radius: 6px; background: var(--card-bg); color: var(--fg); cursor: pointer; }
+  #title-filter-status { font-size: 0.85rem; color: var(--muted); margin-top: 4px; min-height: 1.2em; }
+  .summary { color: var(--muted); font-size: 0.9rem; margin-bottom: 1.5rem; }
+  .match-group { border-radius: 8px; padding: 12px 16px; margin-bottom: 14px; border: 1px solid var(--border); }
+  .match-group.exact { background: var(--exact-bg); border-color: var(--exact-border); }
+  .match-group.near { background: var(--near-bg); border-color: var(--near-border); }
+  .match-group.warn { background: var(--warn-bg); border-color: var(--warn-border); }
+  .cards { display: flex; flex-direction: column; gap: 8px; }
+  .qcard { background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; }
+  .qmeta { font-size: 0.75rem; color: var(--muted); margin-bottom: 4px; }
+  .qtext { font-weight: 500; }
+  .vhead { font-size: 0.85rem; font-weight: 600; margin-bottom: 2px; }
+  .muted, .src { color: var(--muted); font-weight: 400; }
+  .badge { display: inline-block; font-size: 0.72rem; font-weight: 500; border: 1px solid var(--border); border-radius: 10px; padding: 0 8px; margin-left: 6px; color: var(--muted); }
+  .badge.alert { color: var(--alert); border-color: var(--alert); }
+  .choices { margin: 6px 0 0; padding-left: 20px; font-size: 0.9rem; color: var(--muted); }
+  .choices li.changed { color: var(--fg); }
+  .key { color: var(--key); font-weight: 700; }
+  .keyline { font-size: 0.85rem; color: var(--muted); margin-top: 4px; }
+  .keyline.unread { font-style: italic; }
+  ins { background: var(--ins-bg); color: var(--ins-fg); text-decoration: none; border-radius: 3px; padding: 0 2px; }
+  del { background: var(--del-bg); color: var(--del-fg); border-radius: 3px; padding: 0 2px; }
+  .containers { margin: 4px 0 0; padding-left: 20px; font-size: 0.9rem; }
+  .match-group h3 strong, .containers strong { font-weight: 600; }
+  .pulls { margin: 0; padding-left: 18px; }
+  td { vertical-align: top; }
+  .locs { font-size: 0.8rem; color: var(--muted); margin-top: 6px; }
+  .locs summary { cursor: pointer; }
+  .locs ul { margin: 4px 0 0; padding-left: 20px; }
+  .empty { color: var(--muted); font-style: italic; }
+  .verdict { display: inline-block; font-size: 0.75rem; font-weight: 600; border-radius: 10px; padding: 0 8px; border: 1px solid var(--border); white-space: nowrap; }
+  .verdict.safe { color: var(--key); border-color: var(--key); }
+  .verdict.review { color: var(--review-fg); border-color: var(--review-fg); }
+  .verdict.unique, .verdict.keep_copy { color: var(--alert); border-color: var(--alert); }
+  .verdict.covered { color: var(--key); border-style: dashed; border-color: var(--key); }
+  .audit-summary > li { margin-bottom: 8px; }
+  .audit-summary a { text-decoration: none; }
+  .audit-summary ul { margin: 4px 0 0; padding-left: 20px; font-size: 0.9rem; }
+  .audit-summary p { margin: 2px 0 0; }
+  .verdict.empty { color: var(--muted); }
+  .verdict-head { margin-top: 1.6rem; }
+  .coverage-warn { font-size: 0.9rem; border-left: 3px solid var(--warn-border); padding-left: 10px; margin: 6px 0; }
+  details summary { cursor: pointer; font-size: 0.85rem; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+  .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 6px 0 12px; }
+  .compare-grid > .col-head { font-size: 0.8rem; font-weight: 600; color: var(--muted); }
+  .compare-grid > .gap { border: 1px dashed var(--border); border-radius: 6px; padding: 8px 12px;
+                         font-size: 0.85rem; color: var(--muted); }
+  .compare-sum { font-size: 0.9rem; margin: 4px 0 8px; }
+  details.compare { margin: 4px 0 8px; }
+  details.compare > summary { font-size: 0.85rem; }
+  .same-list { font-size: 0.85rem; color: var(--muted); margin: 4px 0 0; padding-left: 20px; }
+  @media (max-width: 640px) { .compare-grid { grid-template-columns: 1fr; } .compare-grid > .col-head { display: none; } }
+"""
+
+
 def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, same_choice_groups, repeated,
                       identical_containers, container_overlaps, unresolved, threshold,
                       total_questions, total_quizzes, total_banks, ctx):
@@ -2394,8 +2602,10 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
             if modified:
                 detail += f" + {modified} as modified versions"
             whole = " <span class='badge'>fully contained</span>" if exact + modified == c.size else ""
+            compare = (f"<details class='compare'><summary>Compare side by side</summary>"
+                       f"{render_comparison(c, other, ctx, limit=COMPARE_LIMIT)}</details>")
             rows += (f"<li>{exact + modified} of {c.size} ({percent:.0f}%) are also in "
-                     f"{container_label(other)} <span class='src'>&mdash; {detail}</span>{whole}</li>")
+                     f"{container_label(other)} <span class='src'>&mdash; {detail}</span>{whole}{compare}</li>")
         overlap_html += f"""
             <div class="match-group near"{filter_attrs("mostly-contained", [c.title] + [h[0].title for h in hits])}>
               <h3>{container_label(c)}</h3>
@@ -2919,89 +3129,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Canvas Quiz Duplicate Report</title>
 <style>
-  :root {{
-    --bg: #ffffff; --fg: #1a1a1a; --muted: #666; --border: #e0e0e0;
-    --exact-bg: #fff4f4; --exact-border: #e57373;
-    --near-bg: #fff9e6; --near-border: #e0c34a;
-    --warn-bg: #fff0e0; --warn-border: #e08a3d;
-    --card-bg: #fafafa;
-    --ins-bg: #d4f5d4; --ins-fg: #14501a; --del-bg: #fbdada; --del-fg: #8a1f1f;
-    --alert: #c62828; --key: #2e7d32; --review-fg: #8a6400;
-  }}
-  @media (prefers-color-scheme: dark) {{
-    :root {{
-      --bg: #1a1a1a; --fg: #eee; --muted: #aaa; --border: #333;
-      --exact-bg: #2a1a1a; --exact-border: #a54a4a;
-      --near-bg: #2a260f; --near-border: #a5904a;
-      --warn-bg: #2a1f0f; --warn-border: #a5723d;
-      --card-bg: #232323;
-      --ins-bg: #1e4023; --ins-fg: #b9f0bf; --del-bg: #4a2020; --del-fg: #f5b5b5;
-      --alert: #ef6c6c; --key: #7fd087; --review-fg: #e0c34a;
-    }}
-  }}
-  body {{ background: var(--bg); color: var(--fg); font-family: -apple-system, Segoe UI, Roboto, sans-serif; max-width: 900px; margin: 0 auto; padding: 24px 16px 80px; line-height: 1.5; }}
-  h1 {{ font-size: 1.5rem; }}
-  h2 {{ margin-top: 2.5rem; border-bottom: 1px solid var(--border); padding-bottom: 6px; }}
-  h3 {{ font-size: 0.95rem; margin: 0 0 8px; }}
-  .top {{ float: right; font-size: 0.75rem; font-weight: 400; margin-top: 0.6em; }}
-  .toc {{ border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; font-size: 0.9rem; }}
-  .toc ul {{ margin: 6px 0 0; padding-left: 20px; }}
-  a {{ color: inherit; }}
-  h2, h3[id], p[id], .match-group[id] {{ scroll-margin-top: 80px; }}
-  [hidden] {{ display: none !important; }}
-  .filter-bar {{ position: sticky; top: 0; z-index: 5; background: var(--bg); padding: 10px 0 8px;
-                 border-bottom: 1px solid var(--border); margin-bottom: 1rem; }}
-  .filter-row {{ display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }}
-  .filter-row input[type=search] {{ flex: 1 1 260px; min-width: 0; font: inherit; padding: 6px 10px;
-                                     border: 1px solid var(--border); border-radius: 6px; background: var(--card-bg); color: var(--fg); }}
-  .filter-row label {{ font-size: 0.85rem; color: var(--muted); white-space: nowrap; }}
-  .filter-row button {{ font: inherit; font-size: 0.85rem; padding: 4px 10px; border: 1px solid var(--border);
-                        border-radius: 6px; background: var(--card-bg); color: var(--fg); cursor: pointer; }}
-  #title-filter-status {{ font-size: 0.85rem; color: var(--muted); margin-top: 4px; min-height: 1.2em; }}
-  .summary {{ color: var(--muted); font-size: 0.9rem; margin-bottom: 1.5rem; }}
-  .match-group {{ border-radius: 8px; padding: 12px 16px; margin-bottom: 14px; border: 1px solid var(--border); }}
-  .match-group.exact {{ background: var(--exact-bg); border-color: var(--exact-border); }}
-  .match-group.near {{ background: var(--near-bg); border-color: var(--near-border); }}
-  .match-group.warn {{ background: var(--warn-bg); border-color: var(--warn-border); }}
-  .cards {{ display: flex; flex-direction: column; gap: 8px; }}
-  .qcard {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; }}
-  .qmeta {{ font-size: 0.75rem; color: var(--muted); margin-bottom: 4px; }}
-  .qtext {{ font-weight: 500; }}
-  .vhead {{ font-size: 0.85rem; font-weight: 600; margin-bottom: 2px; }}
-  .muted, .src {{ color: var(--muted); font-weight: 400; }}
-  .badge {{ display: inline-block; font-size: 0.72rem; font-weight: 500; border: 1px solid var(--border); border-radius: 10px; padding: 0 8px; margin-left: 6px; color: var(--muted); }}
-  .badge.alert {{ color: var(--alert); border-color: var(--alert); }}
-  .choices {{ margin: 6px 0 0; padding-left: 20px; font-size: 0.9rem; color: var(--muted); }}
-  .choices li.changed {{ color: var(--fg); }}
-  .key {{ color: var(--key); font-weight: 700; }}
-  .keyline {{ font-size: 0.85rem; color: var(--muted); margin-top: 4px; }}
-  .keyline.unread {{ font-style: italic; }}
-  ins {{ background: var(--ins-bg); color: var(--ins-fg); text-decoration: none; border-radius: 3px; padding: 0 2px; }}
-  del {{ background: var(--del-bg); color: var(--del-fg); border-radius: 3px; padding: 0 2px; }}
-  .containers {{ margin: 4px 0 0; padding-left: 20px; font-size: 0.9rem; }}
-  .match-group h3 strong, .containers strong {{ font-weight: 600; }}
-  .pulls {{ margin: 0; padding-left: 18px; }}
-  td {{ vertical-align: top; }}
-  .locs {{ font-size: 0.8rem; color: var(--muted); margin-top: 6px; }}
-  .locs summary {{ cursor: pointer; }}
-  .locs ul {{ margin: 4px 0 0; padding-left: 20px; }}
-  .empty {{ color: var(--muted); font-style: italic; }}
-  .verdict {{ display: inline-block; font-size: 0.75rem; font-weight: 600; border-radius: 10px; padding: 0 8px; border: 1px solid var(--border); white-space: nowrap; }}
-  .verdict.safe {{ color: var(--key); border-color: var(--key); }}
-  .verdict.review {{ color: var(--review-fg); border-color: var(--review-fg); }}
-  .verdict.unique, .verdict.keep_copy {{ color: var(--alert); border-color: var(--alert); }}
-  .verdict.covered {{ color: var(--key); border-style: dashed; border-color: var(--key); }}
-  .audit-summary > li {{ margin-bottom: 8px; }}
-  .audit-summary a {{ text-decoration: none; }}
-  .audit-summary ul {{ margin: 4px 0 0; padding-left: 20px; font-size: 0.9rem; }}
-  .audit-summary p {{ margin: 2px 0 0; }}
-  .verdict.empty {{ color: var(--muted); }}
-  .verdict-head {{ margin-top: 1.6rem; }}
-  .coverage-warn {{ font-size: 0.9rem; border-left: 3px solid var(--warn-border); padding-left: 10px; margin: 6px 0; }}
-  details summary {{ cursor: pointer; font-size: 0.85rem; }}
-  table {{ border-collapse: collapse; width: 100%; font-size: 0.9rem; }}
-  th, td {{ text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); }}
-</style>
+{REPORT_CSS}</style>
 </head>
 <body>
   <h1>Canvas Quiz Duplicate / Modified Question Report</h1>
@@ -3098,6 +3226,11 @@ def main():
     ap.add_argument("-o", "--output", default="quiz_duplicate_report.html", help="Output HTML report path")
     ap.add_argument("--json", metavar="PATH",
                     help="Also write the findings to PATH as JSON, with the same sections as the report.")
+    ap.add_argument("--compare", nargs=2, metavar=("A", "B"),
+                    help="Instead of the report, write a side-by-side comparison of two quizzes or banks, named by "
+                         "title (or part of one) or by export id, to --compare-output.")
+    ap.add_argument("--compare-output", metavar="PATH", default="comparison.html",
+                    help="Where --compare writes its page (default comparison.html).")
     ap.add_argument("--plan", metavar="PATH",
                     help="Also write an action plan to PATH (an .xlsx file): what to do with each quiz to get its "
                          "questions into banks, which banks are safe to delete, and which questions are in no bank. "
@@ -3266,6 +3399,14 @@ def main():
            "variants": variants, "bank_audit": bank_audit, "refs_seen": refs_seen,
            "refs_resolved": refs_resolved, "cluster_of": cluster_of, "only_published": args.only_published,
            "classic_quiz_items": classic_quiz_items, "quiz_coverage": coverage}
+    if args.compare:
+        a, b = (find_container(text, containers) for text in args.compare)
+        if a is b:
+            sys.exit("--compare: both names point at the same quiz or bank.")
+        with open(args.compare_output, "w", encoding="utf-8") as f:
+            f.write(build_comparison_page(a, b, ctx))
+        print(f"Comparison of {a.title!r} and {b.title!r} written to {args.compare_output}")
+        return
     report = build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, same_choice_groups, repeated,
                                identical_containers, container_overlaps, unresolved, args.threshold,
                                len(questions), len(quizzes), len(banks), ctx)
