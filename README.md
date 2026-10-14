@@ -198,7 +198,7 @@ Step 4 of the action plan is putting questions into a bank. Instead of retyping 
 To import it:
 
 1. In the course, go to **Settings → Import Course Content**.
-2. Choose **Canvas Course Export Package** and upload the file.
+2. Choose **Canvas Course Export Package** (not QTI .zip) and upload the file. In the content list, the banks appear under **Question Banks**; if they show up under Files instead, Canvas did not recognise the package.
 3. Choose **Select specific content**, then pick the banks you want under Question Banks. You can import just one to try it.
 4. The new banks appear under **Quizzes → Manage Question Banks**. Point the quiz at its bank with a question group, then delete the quiz's own copies of those questions.
 

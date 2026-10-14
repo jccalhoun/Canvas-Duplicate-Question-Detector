@@ -1832,6 +1832,12 @@ class BankExport(ExportCase):
             manifest = z.read("imsmanifest.xml").decode()
             (bank_file,) = [n for n in names if n.startswith("non_cc_assessments/")]
             self.assertIn(f'href="{bank_file}"', manifest)
+            # how Canvas recognises its own export package (lib/canvas/migration/package_identifier.rb):
+            # a manifest resource whose href is the flag file, under the Common Cartridge schema
+            doc = ET.fromstring(manifest)
+            ns = {"m": qd.CC_NS}
+            self.assertEqual(doc.findtext("m:metadata/m:schema", namespaces=ns), "IMS Common Cartridge")
+            self.assertIsNotNone(doc.find("m:resources/m:resource[@href='course_settings/canvas_export.txt']", ns))
             xml = z.read(bank_file).decode()
         self.assertIn("<fieldentry>Old quiz (questions not in a bank)</fieldentry>", xml)
         self.assertNotIn("assessment_question_identifierref", xml)

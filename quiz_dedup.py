@@ -2551,6 +2551,7 @@ REPORT_CSS = """
 QTI_NS = "http://www.imsglobal.org/xsd/ims_qtiasiv1p2"
 CC_NS = "http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1"
 BANK_RESOURCE_TYPE = "associatedcontent/imscc_xmlv1p1/learning-application-resource"
+CANVAS_EXPORT_FLAG = "course_settings/canvas_export.txt"
 
 
 def new_ident(*parts):
@@ -2735,10 +2736,16 @@ def write_bank_export(path, wanted_banks, sources, labels):
         for name, ident in sorted(resources.items()):
             manifest.append(f'    <resource type="webcontent" identifier="{esc(ident)}" href="{esc(name)}">'
                             f'<file href="{esc(name)}"/></resource>')
+        # Canvas only treats the file as its own course export package (and so reads the
+        # banks under non_cc_assessments/) when the manifest lists this flag file as a resource.
+        # Without it the package is taken for a plain Common Cartridge and the banks for files.
+        manifest.append(f'    <resource identifier="{new_ident("canvas_export", *sorted(b for b, _ in banks))}" '
+                        f'type="{BANK_RESOURCE_TYPE}" href="{CANVAS_EXPORT_FLAG}">'
+                        f'<file href="{CANVAS_EXPORT_FLAG}"/></resource>')
         manifest += ["  </resources>", "</manifest>", ""]
         out.writestr("imsmanifest.xml", "\n".join(manifest))
         # Canvas recognises its own course export package by this file
-        out.writestr("course_settings/canvas_export.txt", "Made by quiz_dedup.py --export-banks.\n")
+        out.writestr(CANVAS_EXPORT_FLAG, "Made by quiz_dedup.py --export-banks.\n")
     return len(banks), written, short
 
 
