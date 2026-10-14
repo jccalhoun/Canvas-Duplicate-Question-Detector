@@ -1055,8 +1055,42 @@ class ReviewFixes4(ExportCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             _, _, _, containers = qd.collect_questions([self.export({"non_cc_assessments/gq.xml.qti": xml})])
-        self.assertEqual(containers[0].draws, [("gb", None)])
+        ((bank_id, count),) = containers[0].draws
+        self.assertEqual((bank_id, type(count), count.text), ("gb", qd.UnreadableCount, "three"))
         self.assertIn("unreadable pick count ('three')", err.getvalue())
+        self.assertEqual(qd.describe_contents(containers[0]), "draws an unreadable number from 1 bank")
+
+    def test_unreadable_counts_never_make_quizzes_identical(self):
+        files = {f"non_cc_assessments/{q}.xml.qti": quiz(q, title, [], draws=[("gb", 3)]).replace(
+                     "<selection_number>3<", "<selection_number>three<")
+                 for q, title in (("gq1", "Exam one"), ("gq2", "Exam two"))}
+        files["non_cc_assessments/gb.xml.qti"] = bank("gb", "Pool", [item(MC, STEM, CHOICES, [CHOICES[0]])])
+        with contextlib.redirect_stderr(io.StringIO()):
+            questions, _, _, containers = qd.collect_questions([self.export(files)])
+        variants = qd.build_variants(questions)
+        _, roots, _ = qd.find_version_clusters(variants, 85.0)
+        identical, _ = qd.find_duplicate_containers(variants, roots, containers=containers)
+        self.assertEqual(identical, [])
+        # with a readable count the same two quizzes are identical
+        files = {f"non_cc_assessments/{q}.xml.qti": quiz(q, title, [], draws=[("gb", 3)])
+                 for q, title in (("gq1", "Exam one"), ("gq2", "Exam two"))}
+        files["non_cc_assessments/gb.xml.qti"] = bank("gb", "Pool", [item(MC, STEM, CHOICES, [CHOICES[0]])])
+        questions, _, _, containers = qd.collect_questions([self.export(files)])
+        variants = qd.build_variants(questions)
+        _, roots, _ = qd.find_version_clusters(variants, 85.0)
+        identical, _ = qd.find_duplicate_containers(variants, roots, containers=containers)
+        self.assertEqual(len(identical), 1)
+
+    def test_outputs_may_not_overwrite_inputs_or_each_other(self):
+        path = self.export({"non_cc_assessments/gb.xml.qti": bank("gb", "Pool", [item(MC, STEM, CHOICES, [CHOICES[0]])])})
+        for extra, message in ((["-o", path], "is one of the exports"),
+                               (["-o", os.path.join(self.dir, "r.html"), "--json", os.path.join(self.dir, "r.html")],
+                                "both write to")):
+            err = io.StringIO()
+            with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, *extra]), \
+                    contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+                qd.main()
+            self.assertIn(message, err.getvalue())
 
 
 class Images(ExportCase):
@@ -1597,6 +1631,39 @@ class QuizCoverageCheck(ExportCase):
         self.assertEqual([r["ready"] for r in old_final], ["wait", "wait"])
         self.assertIn("Wait: Old pool has the only other copy", old_final[0]["before"])
         self.assertIn("Keep Old final", next(r for r in plan["quizzes"] if r["quiz"] == "Old pool")["keep"])
+
+    def test_plan_cells_are_never_formulas(self):
+        files = self.course()
+        files["non_cc_assessments/gq3.xml.qti"] = quiz("gq3", "=SUM(A1:A9)", [
+            item(MC, "=1+1 is what?", ["=2", "3", "4", "5"], ["=2"])])
+        path = self.export(files)
+        out, plan_path = os.path.join(self.dir, "report.html"), os.path.join(self.dir, "plan.xlsx")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out, "--plan", plan_path]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        from openpyxl import load_workbook
+        wb = load_workbook(plan_path)
+        cells = [c for ws in wb for row in ws.iter_rows() for c in row if isinstance(c.value, str)
+                 and c.value.startswith("=")]
+        self.assertTrue(cells)
+        self.assertEqual({c.data_type for c in cells}, {"s"})
+        self.assertIn("=SUM(A1:A9)", {c.value for c in cells})
+
+    def test_keep_ignores_quizzes_in_other_exports(self):
+        # Old pool alone holds Q3, the only question of both Old final banks. A quiz in another
+        # export with the same question must not lift the Keep note: it cannot stand in for this course
+        here = self.export(self.course())
+        other = self.export({"non_cc_assessments/gz.xml.qti": quiz("gz", "Other course", [item(*self.Q3)])},
+                            name="other.imscc")
+        out, plan_path = os.path.join(self.dir, "report.html"), os.path.join(self.dir, "plan.xlsx")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", here, other, "-o", out, "--plan", plan_path]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        from openpyxl import load_workbook
+        rows = list(load_workbook(plan_path)["Quizzes"].iter_rows(values_only=True))
+        head = rows[0]
+        old_pool = next(dict(zip(head, r)) for r in rows[1:] if r[head.index("Quiz")].startswith("Old pool"))
+        self.assertIn("Keep Old final", old_pool["Keep"])
 
     def test_bank_table_shows_distinct_count_when_it_differs(self):
         files = self.course()
