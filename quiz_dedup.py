@@ -59,6 +59,9 @@ from rapidfuzz import fuzz, process
 
 TAG_RE = re.compile(r"<!--.*?-->|</?[A-Za-z][^<>]*>", re.S)  # a tag starts with a letter: "x < 3 and y > 5" is not one
 WS_RE = re.compile(r"\s+")
+# zero-width spaces, joiners and byte-order marks: Canvas's editor leaves them around pasted text.
+# They are deleted (not turned into spaces), which is what normalize() already did when matching
+ZERO_WIDTH_RE = re.compile("[\u200b\u200c\u200d\u2060\ufeff]")
 
 
 IMG_RE = re.compile(r"<img\b[^>]*>", re.I)
@@ -187,7 +190,7 @@ def strip_html(text):
     text = IMG_RE.sub(image_token, text)
     text = TAG_RE.sub(" ", text)
     text = html.unescape(text)
-    text = WS_RE.sub(" ", text).strip()
+    text = WS_RE.sub(" ", ZERO_WIDTH_RE.sub("", text)).strip()
     return text
 
 
@@ -321,7 +324,7 @@ def extract_mattext(material_el):
         raw = (child.text or "") + "".join(ET.tostring(c, encoding="unicode") for c in child)
         if (child.get("texttype") or "").lower() == "text/plain" and not len(child):
             # no tags to remove, but Canvas still writes entities such as &nbsp; in plain text
-            parts.append(WS_RE.sub(" ", html.unescape(raw)).strip())
+            parts.append(WS_RE.sub(" ", ZERO_WIDTH_RE.sub("", html.unescape(raw))).strip())
         else:
             parts.append(strip_html(raw))
     return " ".join(p for p in parts if p)
@@ -379,7 +382,7 @@ def credited_answers(item):
                 if (sv.get("action") or "").lower() == "subtract":
                     continue  # a penalty, not credit
                 try:
-                    awards = float((sv.text or "").strip()) > 0
+                    awards = awards or float((sv.text or "").strip()) > 0
                 except ValueError:
                     pass
         if awards:
@@ -1611,7 +1614,8 @@ def quiz_coverage(variants, containers, cluster_of, audit):
     """A QuizCoverage for every quiz that stores questions of its own.
     `cluster_of` maps id(variant) to its modified-question group number and
     `audit` is the bank check, whose statuses say which banks are linked.
-    A bank missing from the audit counts as not linked."""
+    A bank missing from the audit counts as not linked. Only banks in the
+    quiz's own export count: a quiz cannot draw from another course's bank."""
     linked = {(b.bank.source_file, b.bank.cid) for b in audit if b.status == USED_LINKED}
     banks_of, held, by_cluster = [], {}, {}
     for i, v in enumerate(variants):
@@ -1628,8 +1632,9 @@ def quiz_coverage(variants, containers, cluster_of, audit):
         if not idxs:
             continue
         cov = QuizCoverage(c, len(idxs))
+        local_banks = lambda i: {k for k in banks_of[i] if k[0] == c.source_file}
         for i in sorted(idxs):
-            banks = banks_of[i]
+            banks = local_banks(i)
             if banks:
                 cov.banks[i] = sorted(banks)
                 cov.linked_banks |= banks & linked
@@ -1639,7 +1644,7 @@ def quiz_coverage(variants, containers, cluster_of, audit):
                 cov.in_unlinked[i] = sorted(banks)
             else:
                 n = cluster_of.get(id(variants[i]))
-                others = set().union(*(banks_of[j] for j in by_cluster.get(n, ()) if j != i)) if n is not None else set()
+                others = set().union(*(local_banks(j) for j in by_cluster.get(n, ()) if j != i)) if n is not None else set()
                 if others:
                     cov.modified[i] = (n, sorted(others))
                 else:
@@ -2207,18 +2212,32 @@ PLAN_STEPS = {
 }
 
 
-def keep_for_quiz(cov, variants, bank_info):
-    """Banks the bank check calls safe to delete only because this quiz holds
-    the only quiz copy of some of their questions: (export, bank id) keys.
-    Deleting one of them and then changing the quiz loses those questions."""
-    here = (cov.quiz.source_file, cov.quiz.cid)
-    # only quizzes in the same export count, as in the bank check: a quiz in another
-    # course cannot stand in for this course's bank
-    sole = [i for i in cov.in_unlinked
-            if not any(q.source_kind == "quiz" and q.source_file == here[0] and (q.source_file, q.quiz_id) != here
-                       for q in variants[i].occurrences)]
-    return {k for i in sole for k in cov.in_unlinked[i]
-            if k in bank_info and bank_info[k].verdict in (VERDICT_SAFE, VERDICT_COVERED)}
+def staying_banks(audit, extra=()):
+    """(export, bank id) of the banks that will stay: linked banks, banks
+    the bank check keeps as the one copy, and `extra` (in the action plan,
+    the banks quizzes are about to draw from). A bank with unique questions
+    does not count: whether to keep it is the user's call, and deleting it
+    must not strand questions whose other copies were deleted on its account."""
+    keep = {VERDICT_COPY}
+    return {(b.bank.source_file, b.bank.cid) for b in audit
+            if b.status == USED_LINKED or b.verdict in keep} | set(extra)
+
+
+def keep_for_quiz(cov, bank_info, staying):
+    """Banks to keep while this quiz still holds its own questions: (export,
+    bank id) keys. A question the quiz holds whose banks are all unlinked
+    and none of them `staying` survives only as long as some quiz keeps a
+    copy, and the bank check counts those quiz copies as in use. So a bank
+    holding it that the check calls safe to delete (or to review) must
+    wait. Every quiz holding such a question names the bank, so two quizzes
+    sharing the only copies both get the note."""
+    at_risk = (VERDICT_SAFE, VERDICT_COVERED, VERDICT_REVIEW)
+    out = set()
+    for keys in cov.in_unlinked.values():
+        if any(k in staying for k in keys):
+            continue
+        out |= {k for k in keys if k in bank_info and bank_info[k].verdict in at_risk}
+    return out
 
 
 def build_plan(variants, coverage, audit, bank_sizes, show_source=False):
@@ -2243,10 +2262,16 @@ def build_plan(variants, coverage, audit, bank_sizes, show_source=False):
 
     def listing(items, limit=4):
         items = list(items)
-        shown = ", ".join(items[:limit])
-        return shown + (f" and {len(items) - limit} more" if len(items) > limit else "")
+        if len(items) > limit:
+            return ", ".join(items[:limit]) + f" and {len(items) - limit} more"
+        return ", ".join(items[:-1]) + " and " + items[-1] if len(items) > 1 else "".join(items)
 
     quiz_rows, question_rows, holds, uses = [], [], {}, {}
+    for cov in coverage:  # banks the plan has quizzes draw from (steps 1 and 2) will stay
+        cover = cov.cover(bank_sizes)
+        if len(cov.banks) == cov.distinct and len(cover) == 1:
+            uses.setdefault(cover[0][0], [])
+    staying = staying_banks(audit, uses)
     for n, cov in enumerate(coverage, 1):
         c = cov.quiz
         label = c.title.strip()
@@ -2292,15 +2317,15 @@ def build_plan(variants, coverage, audit, bank_sizes, show_source=False):
                                       f"Modified questions, group {group}"))
             for i in cov.missing:
                 question_rows.append((label, i, "In no bank", ""))
-        keep = sorted(keep_for_quiz(cov, variants, bank_info), key=lambda k: bank_label(k).lower())
+        keep = sorted(keep_for_quiz(cov, bank_info, staying), key=lambda k: bank_label(k).lower())
         for k in keep:
             holds.setdefault(k, []).append(label)
         quiz_rows.append({
             "step": step, "what": PLAN_STEPS[step], "quiz": label, "questions": d,
             "published": {True: "yes", False: "no"}.get(c.published, ""),
             "action": action, "banks": banks,
-            "keep": (f"Keep {listing(bank_label(k) for k in keep)}: this quiz has the only other copy of some "
-                     "of their questions." if keep else ""),
+            "keep": (f"Keep {listing(bank_label(k) for k in keep)} until this quiz is done: some of its questions "
+                     "are in no bank that will stay." if keep else ""),
         })
     quiz_rows.sort(key=lambda r: (r["step"], r["quiz"].lower()))
 
@@ -2326,8 +2351,9 @@ def build_plan(variants, coverage, audit, bank_sizes, show_source=False):
                       "the Quizzes tab). Once it does, the bank is in use and drops off this list.")
         elif waiting:
             ready = "wait"
-            before = (f"Wait: {listing(waiting)} {'has' if len(waiting) == 1 else 'have'} the only other copy "
-                      "of some of its questions. Change that quiz first, then rerun and check again.")
+            before = (f"Wait: some of its questions are otherwise only in {listing(waiting)}, and in no bank that "
+                      f"will stay. Finish {'that quiz' if len(waiting) == 1 else 'those quizzes'} first, then "
+                      "rerun and check again.")
         bank_rows.append({
             "ready": ready, "bank": bank_label(key), "questions": b.bank.item_count,
             "status": b.status, "verdict": VERDICT_LABELS[b.verdict], "why": why, "before": before,
@@ -2374,7 +2400,7 @@ def write_plan(path, plan, sources):
         ("2. Respect the Keep column. It names banks this quiz depends on: delete one and change the quiz, "
          "and those questions are gone.", False),
         (f"3. The Banks tab lists banks the bank check calls safe to delete. Delete only rows marked yes ({ready} "
-         "now). Wait means a quiz you have not changed yet holds the only other copy of some of its questions; "
+         "now). Wait means some of its questions are otherwise only in quizzes you have not finished; "
          "no means the plan has a quiz draw from it.", False),
         ("4. Banks not on the Banks tab hold questions found nowhere else, or need a look first. See the "
          "report's bank check.", False),
@@ -2475,6 +2501,7 @@ REPORT_CSS = """
   .vhead { font-size: 0.85rem; font-weight: 600; margin-bottom: 2px; }
   .muted, .src { color: var(--muted); font-weight: 400; }
   .badge { display: inline-block; font-size: 0.72rem; font-weight: 500; border: 1px solid var(--border); border-radius: 10px; padding: 0 8px; margin-left: 6px; color: var(--muted); }
+  .badge.in-use { color: var(--key); border-color: var(--key); }
   .badge.alert { color: var(--alert); border-color: var(--alert); }
   .choices { margin: 6px 0 0; padding-left: 20px; font-size: 0.9rem; color: var(--muted); }
   .choices li.changed { color: var(--fg); }
@@ -2647,19 +2674,28 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
     overlap_html = (overlap_html + no_match("mostly-contained")) if overlap_html else \
         "<p class='empty'>None found at this setting.</p>"
 
+    linked_banks = {(b.bank.source_file, b.bank.cid) for b in ctx.get("bank_audit", []) if b.status == USED_LINKED}
+
+    def in_use_badge(v):
+        """A badge on a version that students can get: it is in a quiz, or in a bank a quiz links to."""
+        if any(q.source_kind == "quiz" or (q.source_file, q.quiz_id) in linked_banks for q in v.occurrences):
+            return " <span class='badge in-use' title='in a quiz, or in a bank a quiz draws from'>in use</span>"
+        return ""
+
     def render_clusters(groups, empty, section, anchor=None):
         rendered = []
         for number, cluster in enumerate(groups, 1):
             ref = cluster[0]
             lead = len(ref.occurrences) > max(len(v.occurrences) for v in cluster[1:])
             cards = [render_variant(ref, ctx, heading="Version A" + (
-                " <span class='muted'>(most used)</span>" if lead else ""))]
+                " <span class='muted'>(most used)</span>" if lead else ""), badges=in_use_badge(ref))]
             any_key = False
             for n, v in enumerate(cluster[1:], 1):
                 badges, keyed = describe_change(ref, v)
                 any_key = any_key or keyed
                 letter = chr(ord("A") + n) if n < 26 else f"#{n + 1}"
-                cards.append(render_variant(v, ctx, heading=f"Version {letter} ", ref=ref, badges=badges))
+                cards.append(render_variant(v, ctx, heading=f"Version {letter} ", ref=ref,
+                                            badges=in_use_badge(v) + badges))
             total = sum(len(v.occurrences) for v in cluster)
             ident = f' id="{anchor}-{number}"' if anchor else ""
             rendered.append((any_key, total, f"""
@@ -2811,6 +2847,35 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
         parts = ([f"{same} as is"] if same else []) + ([f"{modified} modified"] if modified else [])
         return f"{same + modified} of {held} <span class='src'>({', '.join(parts)})</span>"
 
+    twins = {}
+    for b in audit:
+        if b.verdict and b.bank.members:
+            twins.setdefault(frozenset(b.bank.members), []).append(b)
+
+    def twin_note(b):
+        others = [o for o in twins.get(frozenset(b.bank.members), ()) if o is not b] if b.bank.members else []
+        if not others:
+            return ""
+        return (f"<p class='src'>Exactly the same questions as {bank_links(others)}. Only one of them needs "
+                "keeping, and reviewing one reviews them all.</p>")
+
+    def question_labels(idxs):
+        """Escaped stem for each variant index, with the credited answer (or,
+        failing that, the choices) added where two listed questions share a stem."""
+        stems = Counter(variants[i].rep.text for i in idxs)
+        answers = Counter((variants[i].rep.text, tuple(variants[i].rep.correct)) for i in idxs)
+        out = {}
+        for i in idxs:
+            q = variants[i].rep
+            text = esc(short(q.text))
+            if stems[q.text] > 1:
+                if q.correct and answers[(q.text, tuple(q.correct))] == 1:
+                    text += f" <span class='src'>(answer: {esc(short('; '.join(q.correct), 60))})</span>"
+                elif q.choices:
+                    text += f" <span class='src'>(choices: {esc(short(' | '.join(q.choices), 90))})</span>"
+            out[i] = text
+        return out
+
     # same-named banks are the hard case, so those rows also show their first question and a number
     for n, b in enumerate(audit, 1):
         c = b.bank
@@ -2836,26 +2901,33 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                 counts.append(f"{b.count(coverage)} {label}")
         if b.not_compared:
             counts.append(f"{b.not_compared} not compared (excluded by --exclude-type)")
-        lines = ""
-        for f in b.findings:
-            if f.coverage in ("exact", "kept_copy"):
-                continue
-            stem = esc(short(variants[f.variant].rep.text))
+        shown = [f for f in b.findings if f.coverage not in ("exact", "kept_copy")]
+        label = question_labels([f.variant for f in shown])
+        lists = {"reworded": [], "unique": [], "unused_only": []}
+        for f in shown:
             group = ctx["cluster_of"].get(id(variants[f.variant]))
             link = f" &middot; <a href='#modified-{group}'>group {group}</a>" if group else ""
             if f.coverage == "modified":
-                where = f"a modified version is in use in {names(f.places)}{link}"
+                where, kind = f"a modified version is in use in {names(f.places)}{link}", "reworded"
             elif f.coverage == "kept_version":
-                where = f"a modified version is in a bank to keep: {names(f.places)}{link}"
+                where, kind = f"a modified version is in a bank to keep: {names(f.places)}{link}", "reworded"
             elif f.coverage == "unused_only":
-                where = f"kept here; also in unused banks: {names(f.places)}"
+                where, kind = f"also in unused banks: {names(f.places)}", "unused_only"
             else:
-                where = "found nowhere else in the export"
-            lines += f"<li>{stem} <span class='src'>&mdash; {where}</span></li>"
+                where, kind = "", "unique"
+            lists[kind].append(f"<li>{label[f.variant]}" + (f" <span class='src'>&mdash; {where}</span>" if where else "")
+                               + "</li>")
         in_use = {t for f in b.findings if f.coverage == "exact" for t in f.places}
         detail = ""
-        if lines:
-            detail += f"<details open><summary>Questions to look at</summary><ul class='containers'>{lines}</ul></details>"
+        for kind, summary in (("reworded", "reworded: compare before deleting"),
+                              ("unique", "found nowhere else in the export"),
+                              ("unused_only", "kept here, also in other unused banks")):
+            items = lists[kind]
+            if items:
+                # the reworded ones are what needs a look; open them when the list is short
+                opened = " open" if kind == "reworded" and len(items) <= 10 else ""
+                detail += (f"<details{opened}><summary>{plural(len(items), 'question')} {summary}</summary>"
+                           f"<ul class='containers'>{''.join(items)}</ul></details>")
         if in_use:
             detail += (f"<details><summary>Where the exact copies are in use</summary>"
                        f"<p class='src'>{names(in_use)}</p></details>")
@@ -2872,7 +2944,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                 {plural(c.size, 'distinct question')} &middot; {esc(b.status)}
                 <span class='verdict {b.verdict}'>{VERDICT_LABELS[b.verdict]}</span></h3>
               <p class='src'>{'; '.join(counts) or 'No questions in the export.'}</p>
-              {copied}{detail}
+              {twin_note(b)}{copied}{detail}
             </div>
             """)
     # ---- written summary of the verdicts
@@ -3018,6 +3090,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
         return one if n == 1 else many
 
     coverage_cards = ""
+    staying = staying_banks(audit)
     quiz_title_count = Counter((cov.quiz.source_file, cov.quiz.title.lower()) for cov in coverage)
     for n, cov in enumerate(coverage, 1):
         c = cov.quiz
@@ -3068,12 +3141,12 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                          f"{plural(len(cov.missing), 'question')} {are(len(cov.missing))} in no bank.")
 
         # ---- a bank the bank check calls safe to delete only because this quiz has copies of its questions
-        safe = sorted(keep_for_quiz(cov, variants, bank_info), key=lambda k: bank_titles.get(k, "").lower())
+        safe = sorted(keep_for_quiz(cov, bank_info, staying), key=lambda k: bank_titles.get(k, "").lower())
         caution = ""
         if safe:
-            caution = (f"<p class='coverage-warn'>Keep {name_list(safe)} if you change this quiz. The bank check "
-                       f"calls {are(len(safe), 'it', 'them')} safe to delete because this quiz has copies of "
-                       f"{are(len(safe), 'its', 'their')} questions.</p>")
+            caution = (f"<p class='coverage-warn'>Keep {name_list(safe)} if you change this quiz. Some of its "
+                       "questions are in no bank that will stay, and the bank check counts this quiz's copies of "
+                       f"them as in use when it judges {are(len(safe), 'that bank', 'those banks')}.</p>")
 
         # ---- the per-question detail, folded away
         detail = ""

@@ -1537,8 +1537,8 @@ class QuizCoverageCheck(ExportCase):
         # Old pool's Q3 is only in the two Old final banks, which its copy makes safe to delete
         old_pool = self.card(report, "Old pool")
         self.assertRegex(old_pool, r"<p class='coverage-warn'>Keep <strong>Old final</strong>.* and "
-                                   r"<strong>Old final</strong>.* if you change this quiz\. The bank check calls them "
-                                   r"safe to delete because this quiz has copies of their questions\.</p>")
+                                   r"<strong>Old final</strong>.* if you change this quiz\. Some of its questions are "
+                                   r"in no bank that will stay")
 
     def test_no_caution_when_another_quiz_also_has_a_copy(self):
         # the Fallacies quiz copy of Q5 is only in Extra; with a second quiz holding the same copy,
@@ -1549,6 +1549,28 @@ class QuizCoverageCheck(ExportCase):
         card = self.card(report, "Fallacies quiz 2")
         self.assertIn("Every question is in the bank <strong>Extra</strong>", card)
         self.assertNotIn("coverage-warn", card)
+
+    def test_two_quizzes_sharing_the_only_copies_both_hold_the_bank(self):
+        # Q3 is only in the two unlinked Old final banks, and in two quizzes. Each bank is "safe"
+        # because the quizzes hold copies; finishing both quizzes would lose Q3, so both must say Keep
+        # and the banks must wait for both
+        files = self.course()
+        files["non_cc_assessments/gq4.xml.qti"] = quiz("gq4", "Second pool", [item(*self.Q3), item(*self.Q6)])
+        path = self.export(files)
+        out, plan_path = os.path.join(self.dir, "report.html"), os.path.join(self.dir, "plan.xlsx")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out, "--plan", plan_path]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with open(out, encoding="utf-8") as f:
+            report = f.read()
+        for title in ("Old pool", "Second pool"):
+            self.assertIn("coverage-warn'>Keep <strong>Old final</strong>", self.card(report, title))
+        from openpyxl import load_workbook
+        rows = list(load_workbook(plan_path)["Banks"].iter_rows(values_only=True))
+        head = rows[0]
+        old_final = [dict(zip(head, r)) for r in rows[1:] if r[head.index("Bank")].startswith("Old final")]
+        self.assertEqual([r["Ready to delete"] for r in old_final], ["wait", "wait"])
+        self.assertIn("Old pool and Second pool", old_final[0]["Before deleting"])
 
     def test_same_named_quizzes_are_numbered(self):
         files = self.course()
@@ -1629,7 +1651,7 @@ class QuizCoverageCheck(ExportCase):
         plan = qd.build_plan(variants, coverage, audit, sizes)
         old_final = [r for r in plan["banks"] if r["bank"].startswith("Old final")]
         self.assertEqual([r["ready"] for r in old_final], ["wait", "wait"])
-        self.assertIn("Wait: Old pool has the only other copy", old_final[0]["before"])
+        self.assertIn("Wait: some of its questions are otherwise only in Old pool", old_final[0]["before"])
         self.assertIn("Keep Old final", next(r for r in plan["quizzes"] if r["quiz"] == "Old pool")["keep"])
 
     def test_plan_cells_are_never_formulas(self):

@@ -76,7 +76,7 @@ The report opens with a summary and a table of contents. Each entry links to its
 
 In the **Modified questions** section, each group is one question:
 
-- **Version A** is the version used in the most places.
+- **Version A** is the version used in the most places. A version students can get, because it is in a quiz or in a bank a quiz draws from, has an **in use** badge, so you can tell the live wording from old copies.
 - Every other version is shown as a diff against Version A, with added wording highlighted in green and removed wording in red, in both the stem and the choices.
 - A check mark shows the credited answer.
 - Badges say what changed: *Stem reworded*, *Choices changed*, *Question type differs*, or *Answer key differs*.
@@ -167,7 +167,7 @@ Only quizzes and linked banks count as in use. Otherwise two unused copies of on
 
 The section opens with a summary of each verdict and the banks in it. Banks with unique questions are listed by how many they hold, with numbered families such as `chapter_1-...`, `chapter_2-...` folded into one line. Each *keep as the one copy* example names the banks that rely on it. When several banks share a title, each gets a number (`#12`) used everywhere in the section, and the table also shows its first question.
 
-Each review item links to its group in *Modified questions*, where the word-level diff shows what changed.
+Each bank's questions are listed in up to three folded lists: the **reworded** ones (open when there are ten or fewer, since they are what needs a look), the ones **found nowhere else**, and the ones **kept here, also in other unused banks**. Each reworded item links to its group in *Modified questions*, where the word-level diff shows what changed. When two listed questions share a stem, the credited answer (or the choices) is added so they can be told apart. A bank with exactly the same questions as another unlinked bank says so: only one needs keeping, and reviewing one reviews them all.
 
 The statuses can be checked against the Unused Classic Quiz Bank Checker: its *Used?* column should read `LINKED`, `COPIED ONLY` or `no` for the same banks. Match banks by title and question count, since the export does not carry Canvas's bank ids.
 
@@ -180,7 +180,7 @@ The second section answers one question for every quiz that has questions of its
 - **Every question is in a bank, spread over N banks**, with how many each bank adds. The fewest banks that cover the quiz are picked, preferring a bank a quiz already links to, then the smallest.
 - How many questions are in a bank **only as a reworded version**, and how many are in **no bank**.
 
-A **Keep X** note appears when the bank check calls a bank safe to delete only because this quiz holds copies of its questions, and no other quiz does. The quiz and the bank vouch for each other, so if you change the quiz, keep the bank.
+A **Keep X** note appears when some of the quiz's questions are in no bank that will stay (a linked bank, or one kept as the one copy), and X holds them with a verdict of safe to delete or review. The bank check counts quiz copies as in use, so the quiz and the bank vouch for each other: if you change the quiz, keep the bank. When several quizzes hold the only copies, each of them gets the note.
 
 Each card can be expanded to show the reworded questions (each linked to its group in *Modified questions*, where the wording diff is), the questions in no bank, and which banks hold each question.
 
@@ -219,8 +219,8 @@ The report answers "what is duplicated where". The action plan answers "what do 
   - **Step 3, spread over banks**: copy the questions into one new bank and use one question group.
   - **Step 4, put questions in a bank first**: some questions are in no bank, or only as a reworded version. A quiz whose missing questions are all essay, numerical and similar types is flagged as possibly an assignment you would rather leave alone.
 
-  The **Keep** column names banks the quiz depends on: the bank check calls them safe to delete only because this quiz has the only other copy of some of their questions.
-- **Banks**: the banks the bank check calls safe to delete, with why, and whether to go ahead. **yes** means delete it. **wait** means a quiz you have not changed yet holds the only other copy of some of its questions. **no** means the plan has a quiz draw from it, so it will be in use.
+  The **Keep** column names banks to keep until the quiz is done: some of its questions are in no bank that will stay (linked, kept as the one copy, or about to be drawn from by the plan).
+- **Banks**: the banks the bank check calls safe to delete, with why, and whether to go ahead. **yes** means delete it. **wait** means some of its questions are otherwise only in quizzes you have not finished, and in no bank that will stay; it names those quizzes. **no** means the plan has a quiz draw from it, so it will be in use.
 - **Questions**: every question from a step 4 quiz that is in no bank, or only reworded in one, with its type, choices and answer, ready to add to a bank.
 
 Quizzes and banks that share a title carry the same `#` number as in the report. Nothing is changed in Canvas: the plan is a checklist for doing the work by hand. Text from the export is written as plain text, so a question starting with `=` is never run as a formula. When several exports are compared, only quizzes in the same export count for the Keep column, as in the bank check. After a round of changes, export the course again and rerun. Finished work drops off and the plan gets shorter.
