@@ -406,6 +406,20 @@ def container_engine(container):
     return "classic"
 
 
+class UnreadableCount:
+    """A question group's pick count that could not be read as a number.
+    Kept apart from None, which means "every question in the bank", and
+    equal only to itself, so two quizzes are never called identical on the
+    strength of an unreadable count."""
+    __slots__ = ("text",)
+
+    def __init__(self, text):
+        self.text = text
+
+    def __repr__(self):
+        return f"UnreadableCount({self.text!r})"
+
+
 def bank_draws(container):
     """[(bank id, how many)] for each question group in a quiz that pulls its
     questions from a bank instead of holding them. This is how a New Quiz
@@ -424,8 +438,10 @@ def bank_draws(container):
                     try:
                         count = int(text)
                     except ValueError:
+                        count = UnreadableCount(text)
                         print(f"  ! question group in \"{get_container_title(container)}\" has an unreadable "
-                              f"pick count ({text!r}); shown as all questions", file=sys.stderr)
+                              f"pick count ({text!r}); it is reported as unreadable and not matched with "
+                              "other quizzes", file=sys.stderr)
         if bank_id:
             draws.append((bank_id, count))
     return draws
@@ -1216,12 +1232,15 @@ def describe_contents(c):
         parts.append(f"uses {plural(len(c.picks), 'bank question')}")
     if c.draws:
         whole = {b for b, n in c.draws if n is None}   # New Quizzes: every question in the bank
-        counted = [(b, n) for b, n in c.draws if n is not None]
+        counted = [(b, n) for b, n in c.draws if isinstance(n, int)]
+        unknown = {b for b, n in c.draws if isinstance(n, UnreadableCount)}
         if whole:
             parts.append(f"uses all of {plural(len(whole), 'bank')}")
         if counted:
             parts.append(f"draws {sum(n for _, n in counted)} from "
                          f"{plural(len({b for b, _ in counted}), 'bank')}")
+        if unknown:
+            parts.append(f"draws an unreadable number from {plural(len(unknown), 'bank')}")
     return " + ".join(parts)
 
 
@@ -2041,7 +2060,10 @@ def build_json_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
             out["drawn_on_by"] = used_by(c.source_file, c.cid)
         else:
             # count is null when the quiz uses every question in the bank
-            out["draws"] = [{"bank_id": b, "bank_title": bank_title(c, b), "count": n} for b, n in c.draws]
+            out["draws"] = [dict({"bank_id": b, "bank_title": bank_title(c, b),
+                                  "count": None if isinstance(n, UnreadableCount) else n},
+                                 **({"count_unreadable": n.text} if isinstance(n, UnreadableCount) else {}))
+                            for b, n in c.draws]
             out["picks"] = [{"bank_id": b, "bank_title": bank_title(c, b), "item_id": i} for b, i in c.picks]
             out["picks_not_found"] = c.lost_picks
             # draws from banks left out with --exclude-title are not part of any comparison
@@ -2190,8 +2212,11 @@ def keep_for_quiz(cov, variants, bank_info):
     the only quiz copy of some of their questions: (export, bank id) keys.
     Deleting one of them and then changing the quiz loses those questions."""
     here = (cov.quiz.source_file, cov.quiz.cid)
+    # only quizzes in the same export count, as in the bank check: a quiz in another
+    # course cannot stand in for this course's bank
     sole = [i for i in cov.in_unlinked
-            if not any(q.source_kind == "quiz" and (q.source_file, q.quiz_id) != here for q in variants[i].occurrences)]
+            if not any(q.source_kind == "quiz" and q.source_file == here[0] and (q.source_file, q.quiz_id) != here
+                       for q in variants[i].occurrences)]
     return {k for i in sole for k in cov.in_unlinked[i]
             if k in bank_info and bank_info[k].verdict in (VERDICT_SAFE, VERDICT_COVERED)}
 
@@ -2372,6 +2397,11 @@ def write_plan(path, plan, sources):
             cell.font, cell.fill = head_font, head_fill
         for row in rows:
             ws.append([row.get(key, "") if key else "" for _, key, _ in columns])
+            for cell in ws[ws.max_row]:
+                # openpyxl writes a string starting with "=" as a formula; question text
+                # and titles come from the export, so keep every string a plain string
+                if isinstance(cell.value, str) and cell.value.startswith("="):
+                    cell.data_type = "s"
         for n, (_, _, width) in enumerate(columns, 1):
             ws.column_dimensions[ws.cell(1, n).column_letter].width = width
         for row in ws.iter_rows(min_row=2):
@@ -2561,7 +2591,9 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
             for bank_id, n in sorted(Counter(b for b, _ in c.picks).items(), key=lambda kv: kv[0]):
                 pulls += f"<li>{plural(n, 'chosen question')} from {bank_name(c, bank_id)}</li>"
             for bank_id, count in c.draws:
-                amount = "all questions" if count is None else f"{count} at random"
+                amount = ("all questions" if count is None else
+                          f"an unreadable number ({esc(count.text)})" if isinstance(count, UnreadableCount)
+                          else f"{count} at random")
                 pulls += f"<li>{amount} from {bank_name(c, bank_id)}</li>"
             note = (f"<li class='src'>{plural(c.lost_picks, 'chosen question')} could not be found in the "
                     "export</li>" if c.lost_picks else "")
@@ -3275,6 +3307,20 @@ def main():
             ap.error(f"--{name.replace('_', '-')} must be between 0 and 100")
     if args.min_container < 1:
         ap.error("--min-container must be at least 1")
+    # no output may overwrite an input export or another output
+    same_file = lambda path: os.path.normcase(os.path.realpath(path))
+    outputs = ([("--compare-output", args.compare_output)] if args.compare else
+               [("--output", args.output), ("--json", args.json), ("--plan", args.plan)])
+    outputs = [(flag, path) for flag, path in outputs if path]
+    inputs = {same_file(p) for p in args.sources}
+    seen = {}
+    for flag, path in outputs:
+        key = same_file(path)
+        if key in inputs:
+            ap.error(f"{flag} {path} is one of the exports being read; choose another file name")
+        if key in seen:
+            ap.error(f"{flag} and {seen[key]} both write to {path}")
+        seen[key] = flag
     # the matching functions read these module settings when they run
     for name, _, _ in ADVANCED_SETTINGS:
         value = getattr(args, name.lower())

@@ -125,7 +125,7 @@ The JSON file holds the same findings as the HTML report, in the same order, for
 | `exact_duplicates`, `same_stem_unrelated_choices`, `same_choices_and_answer_different_stem`, `repeated_answer_choices` | The other question lists |
 | `unresolved_bank_references` | Bank references whose bank is not in the export |
 
-Each question has its type, stem, choices, answer key, and a list of locations with the quiz or bank title and the export's item id. In a cluster, version A is the most-used version (the first one found on a tie), and every other version has a `changes_from_a` entry saying whether the stem, choices, question type, or answer key differ and how similar they are. A draw with `"count": null` means the quiz uses every question in that bank.
+Each question has its type, stem, choices, answer key, and a list of locations with the quiz or bank title and the export's item id. In a cluster, version A is the most-used version (the first one found on a tie), and every other version has a `changes_from_a` entry saying whether the stem, choices, question type, or answer key differ and how similar they are. A draw with `"count": null` means the quiz uses every question in that bank, unless it also has `"count_unreadable"`: then the export gave a pick count that is not a number, shown there as written. Such a draw is never matched with another quiz's.
 
 The word-level diffs are only in the HTML report.
 
@@ -223,7 +223,7 @@ The report answers "what is duplicated where". The action plan answers "what do 
 - **Banks**: the banks the bank check calls safe to delete, with why, and whether to go ahead. **yes** means delete it. **wait** means a quiz you have not changed yet holds the only other copy of some of its questions. **no** means the plan has a quiz draw from it, so it will be in use.
 - **Questions**: every question from a step 4 quiz that is in no bank, or only reworded in one, with its type, choices and answer, ready to add to a bank.
 
-Quizzes and banks that share a title carry the same `#` number as in the report. Nothing is changed in Canvas: the plan is a checklist for doing the work by hand. After a round of changes, export the course again and rerun. Finished work drops off and the plan gets shorter.
+Quizzes and banks that share a title carry the same `#` number as in the report. Nothing is changed in Canvas: the plan is a checklist for doing the work by hand. Text from the export is written as plain text, so a question starting with `=` is never run as a formula. When several exports are compared, only quizzes in the same export count for the Keep column, as in the bank check. After a round of changes, export the course again and rerun. Finished work drops off and the plan gets shorter.
 
 ## Duplicate quizzes and banks
 
