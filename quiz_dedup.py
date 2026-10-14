@@ -2545,6 +2545,203 @@ REPORT_CSS = """
 """
 
 
+# ---------------------------------------------------------------------------
+# Bank export (--export-banks): questions in no bank, as a package Canvas imports
+# ---------------------------------------------------------------------------
+QTI_NS = "http://www.imsglobal.org/xsd/ims_qtiasiv1p2"
+CC_NS = "http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1"
+BANK_RESOURCE_TYPE = "associatedcontent/imscc_xmlv1p1/learning-application-resource"
+
+
+def new_ident(*parts):
+    """A fresh Canvas-style ident ("g" + 32 hex), stable for the same inputs,
+    so importing the same file twice updates the banks instead of doubling them."""
+    return "g" + hashlib.md5("\x00".join(("quiz_dedup bank export",) + parts).encode("utf-8")).hexdigest()
+
+
+def banks_to_export(coverage, variants):
+    """[(quiz Container, [item ident, ...])] for each Classic quiz with
+    questions that are in no bank as is: those in no bank at all and those
+    in a bank only as a reworded version (the quiz's own wording is what
+    goes in). A question the quiz repeats goes in once. New Quizzes are
+    left out: their item banks are imported a different way. So are
+    questions Canvas exported as type "Error", which hold only their text."""
+    out = []
+    for cov in coverage:
+        c = cov.quiz
+        if c.engine != "classic":
+            continue
+        idents = []
+        for i in list(cov.missing) + list(cov.modified):
+            if variants[i].rep.question_type == "Error":
+                continue
+            mine = [q for q in variants[i].occurrences
+                    if q.source_kind == "quiz" and (q.source_file, q.quiz_id) == (c.source_file, c.cid)]
+            if mine:
+                idents.append(min(mine, key=lambda q: q.item_id).item_id)
+        if idents:
+            out.append((c, sorted(idents)))
+    return out
+
+
+class ExportFiles:
+    """Read-only access to one export's files, whether it is a zip or a folder."""
+
+    def __init__(self, path):
+        self.path = path
+        self.zip = None if os.path.isdir(path) else zipfile.ZipFile(path)
+        if self.zip:
+            self.names = self.zip.namelist()
+        else:
+            self.names = [os.path.relpath(os.path.join(d, f), path).replace(os.sep, "/")
+                          for d, _, files in os.walk(path) for f in files]
+        self.lower = {n.lower(): n for n in self.names}
+
+    def read(self, name):
+        name = self.lower.get(name.lower())
+        if name is None:
+            return None
+        if self.zip:
+            return self.zip.read(name)
+        with open(os.path.join(self.path, name), "rb") as f:
+            return f.read()
+
+    def close(self):
+        if self.zip:
+            self.zip.close()
+
+
+def find_items(files, wanted):
+    """{(quiz id, item ident): <item> element} for the quiz items in
+    `wanted` (quiz id -> set of item idents), read from the export's QTI
+    files. The copy under non_cc_assessments/ is preferred: it carries
+    Canvas's own question types and settings."""
+    found = {}
+    names = [n for n in files.names if n.lower().endswith((".xml", ".qti"))
+             and os.path.basename(n).lower() not in ("imsmanifest.xml", "assessment_meta.xml")]
+    names.sort(key=lambda n: "non_cc_assessments/" not in n.lower())  # preferred copies first
+    for name in names:
+        data = files.read(name)
+        if not data or b"questestinterop" not in data[:2000] or not any(q.encode() in data for q in wanted):
+            continue
+        try:
+            root = ET.fromstring(data)
+        except ET.ParseError:
+            continue
+        for container in root.iter():
+            if local(container.tag) not in CONTAINER_TAGS or container.get("ident") not in wanted:
+                continue
+            quiz_id = container.get("ident")
+            for el in own_items(container):
+                key = (quiz_id, el.get("ident"))
+                if key[1] in wanted[quiz_id] and key not in found:
+                    found[key] = el
+    return found
+
+
+def item_files(item):
+    """Export file paths (under web_resources/) that an item's text refers to."""
+    text = "".join(item.itertext()) + "".join(v for el in item.iter() for v in el.attrib.values())
+    paths = set()
+    for base in (FILEBASE, "$IMS_CC_FILEBASE$/"):
+        for m in re.finditer(re.escape(base) + r"""([^"'<>\s?#]+)""", text):
+            paths.add("web_resources/" + urllib.parse.unquote(m.group(1)))
+    return paths
+
+
+def manifest_files(files):
+    """{file path: manifest resource identifier} for the export's files, so
+    a copied picture keeps its identity and maps to the course's existing file."""
+    data = files.read("imsmanifest.xml")
+    if not data:
+        return {}
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return {}
+    out = {}
+    for res in root.iter():
+        if local(res.tag) == "resource" and res.get("href"):
+            out[urllib.parse.unquote(res.get("href"))] = res.get("identifier")
+    return out
+
+
+def write_bank_export(path, wanted_banks, sources, labels):
+    """Write `path`: a Canvas course export package holding one question
+    bank per quiz in `wanted_banks` (from banks_to_export()), with the
+    quiz's original question XML and the pictures the questions show.
+    Returns (banks written, questions written, [(quiz title, missing count)])."""
+    ET.register_namespace("", QTI_NS)
+    by_source = {}
+    for quiz, idents in wanted_banks:
+        by_source.setdefault(quiz.source_file, []).append((quiz, idents))
+    path_of = dict(zip(labels, sources))
+    banks, short, written, resources = [], [], 0, {}
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as out:
+        for label, quizzes in by_source.items():
+            files = ExportFiles(path_of[label])
+            try:
+                items = find_items(files, {q.cid: set(ids) for q, ids in quizzes})
+                known = manifest_files(files)
+                for quiz, idents in quizzes:
+                    bank_id = new_ident(label, quiz.cid)
+                    ns = QTI_NS
+                    root = ET.Element(f"{{{ns}}}questestinterop")
+                    bank = ET.SubElement(root, f"{{{ns}}}objectbank", ident=bank_id)
+                    meta = ET.SubElement(bank, f"{{{ns}}}qtimetadata")
+                    title = f"{quiz.title.strip()} (questions not in a bank)"
+                    for key, value in (("bank_title", title), ("bank_state", "active")):
+                        field_el = ET.SubElement(meta, f"{{{ns}}}qtimetadatafield")
+                        ET.SubElement(field_el, f"{{{ns}}}fieldlabel").text = key
+                        ET.SubElement(field_el, f"{{{ns}}}fieldentry").text = value
+                    count = 0
+                    for ident in idents:
+                        el = items.get((quiz.cid, ident))
+                        if el is None:
+                            continue
+                        copy = ET.fromstring(ET.tostring(el))
+                        copy.set("ident", new_ident(label, quiz.cid, ident))
+                        # the link back to the bank question it came from would point at nothing
+                        for meta_el in list(copy.iter()):
+                            for f in list(meta_el):
+                                if local(f.tag) == "qtimetadatafield" and any(
+                                        local(x.tag) == "fieldlabel" and (x.text or "").strip() ==
+                                        "assessment_question_identifierref" for x in f):
+                                    meta_el.remove(f)
+                        bank.append(copy)
+                        count += 1
+                        for name in item_files(copy):
+                            data = files.read(name)
+                            if data is not None and name not in resources:
+                                out.writestr(name, data)
+                                resources[name] = known.get(name) or new_ident(label, name)
+                    if count < len(idents):
+                        short.append((quiz.title, len(idents) - count))
+                    if count:
+                        href = f"non_cc_assessments/{bank_id}.xml.qti"
+                        out.writestr(href, b'<?xml version="1.0" encoding="UTF-8"?>\n'
+                                     + ET.tostring(root, encoding="utf-8").split(b"?>", 1)[-1].lstrip())
+                        banks.append((bank_id, href))
+                        written += count
+            finally:
+                files.close()
+        manifest = ['<?xml version="1.0" encoding="UTF-8"?>',
+                    f'<manifest identifier="{new_ident("manifest", *sorted(b for b, _ in banks))}" xmlns="{CC_NS}">',
+                    "  <metadata><schema>IMS Common Cartridge</schema><schemaversion>1.1.0</schemaversion></metadata>",
+                    "  <organizations/>", "  <resources>"]
+        for bank_id, href in banks:
+            manifest.append(f'    <resource identifier="{bank_id}" type="{BANK_RESOURCE_TYPE}" href="{esc(href)}">'
+                            f'<file href="{esc(href)}"/></resource>')
+        for name, ident in sorted(resources.items()):
+            manifest.append(f'    <resource type="webcontent" identifier="{esc(ident)}" href="{esc(name)}">'
+                            f'<file href="{esc(name)}"/></resource>')
+        manifest += ["  </resources>", "</manifest>", ""]
+        out.writestr("imsmanifest.xml", "\n".join(manifest))
+        # Canvas recognises its own course export package by this file
+        out.writestr("course_settings/canvas_export.txt", "Made by quiz_dedup.py --export-banks.\n")
+    return len(banks), written, short
+
+
 def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, same_choice_groups, repeated,
                       identical_containers, container_overlaps, unresolved, threshold,
                       total_questions, total_quizzes, total_banks, ctx):
@@ -3336,6 +3533,10 @@ def main():
                          "title (or part of one) or by export id, to --compare-output.")
     ap.add_argument("--compare-output", metavar="PATH", default="comparison.html",
                     help="Where --compare writes its page (default comparison.html).")
+    ap.add_argument("--export-banks", metavar="PATH",
+                    help="Also write PATH (an .imscc file) holding, for each Classic quiz with questions in no bank, "
+                         "a question bank of those questions, to import into Canvas as a Canvas Course Export "
+                         "Package.")
     ap.add_argument("--plan", metavar="PATH",
                     help="Also write an action plan to PATH (an .xlsx file): what to do with each quiz to get its "
                          "questions into banks, which banks are safe to delete, and which questions are in no bank. "
@@ -3383,7 +3584,8 @@ def main():
     # no output may overwrite an input export or another output
     same_file = lambda path: os.path.normcase(os.path.realpath(path))
     outputs = ([("--compare-output", args.compare_output)] if args.compare else
-               [("--output", args.output), ("--json", args.json), ("--plan", args.plan)])
+               [("--output", args.output), ("--json", args.json), ("--plan", args.plan),
+                ("--export-banks", args.export_banks)])
     outputs = [(flag, path) for flag, path in outputs if path]
     inputs = {same_file(p) for p in args.sources}
     seen = {}
@@ -3552,6 +3754,24 @@ def main():
         plan = build_plan(variants, coverage, bank_audit, sizes, ctx["show_source"])
         write_plan(args.plan, plan, export_labels(args.sources))
         print(f"Action plan written to {args.plan}")
+    if args.export_banks:
+        wanted = banks_to_export(coverage, variants)
+        skipped = sum(1 for cov in coverage if cov.quiz.engine != "classic" and (cov.missing or cov.modified))
+        broken = sum(1 for cov in coverage if cov.quiz.engine == "classic"
+                     for i in list(cov.missing) + list(cov.modified) if variants[i].rep.question_type == "Error")
+        n_banks, n_questions, short = write_bank_export(args.export_banks, wanted, args.sources,
+                                                        export_labels(args.sources))
+        print(f"Bank export written to {args.export_banks}: {plural(n_banks, 'bank')}, "
+              f"{plural(n_questions, 'question')}")
+        for title, n in short:
+            print(f"  ! {plural(n, 'question')} of \"{title}\" could not be found in the export files and "
+                  "were left out", file=sys.stderr)
+        if skipped:
+            print(f"  {plural(skipped, 'New Quiz', 'New Quizzes')} with questions in no bank left out: "
+                  "New Quizzes item banks are imported a different way")
+        if broken:
+            print(f"  {plural(broken, 'question')} Canvas could not export (type Error) left out: "
+                  "recreate them by hand")
 
 
 if __name__ == "__main__":

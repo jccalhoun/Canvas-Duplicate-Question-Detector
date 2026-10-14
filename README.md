@@ -53,6 +53,7 @@ python3 quiz_dedup.py fall.imscc spring.imscc -o report.html
 | `-o`, `--output` | `quiz_duplicate_report.html` | Where to write the report |
 | `--json PATH` | (none) | Also write the findings to `PATH` as JSON |
 | `--plan PATH` | (none) | Also write an action plan to `PATH`, an `.xlsx` file (see *Action plan*) |
+| `--export-banks PATH` | (none) | Also write a package of new question banks for questions in no bank (see *Exporting questions into new banks*) |
 | `--compare A B` | (none) | Instead of the report, compare two quizzes or banks side by side (see *Comparing two quizzes or banks*) |
 | `--compare-output PATH` | `comparison.html` | Where `--compare` writes its page |
 | `-t`, `--threshold` | `85` | How similar (0 to 100) the stem or the choices must be for two questions to count as versions of each other |
@@ -185,6 +186,25 @@ A **Keep X** note appears when some of the quiz's questions are in no bank that 
 Each card can be expanded to show the reworded questions (each linked to its group in *Modified questions*, where the wording diff is), the questions in no bank, and which banks hold each question.
 
 The heading of each card gives the question count. Distinct questions are shown too when the quiz repeats a question. Quizzes that share a title are numbered (`#29`) and show their first question, as same-named banks do. A question Canvas could not export is written with the type `Error` and only its text. The report says so wherever it shows one. Quizzes that draw all their questions from banks are not listed. Questions removed with `--exclude-type` are not counted. Cards are sorted by title and work with the title filter.
+
+## Exporting questions into new banks
+
+```
+python3 quiz_dedup.py export.imscc -o report.html --plan plan.xlsx --export-banks new_banks.imscc
+```
+
+Step 4 of the action plan is putting questions into a bank. Instead of retyping them, `--export-banks` writes a file Canvas can import: one new question bank per Classic quiz, named "*quiz title* (questions not in a bank)", holding that quiz's questions that are in no bank as is. Questions found in a bank only as a reworded version go in too, in the quiz's wording. Questions already in a bank unchanged are left out, so no new duplicates are made.
+
+To import it:
+
+1. In the course, go to **Settings → Import Course Content**.
+2. Choose **Canvas Course Export Package** and upload the file.
+3. Choose **Select specific content**, then pick the banks you want under Question Banks. You can import just one to try it.
+4. The new banks appear under **Quizzes → Manage Question Banks**. Point the quiz at its bank with a question group, then delete the quiz's own copies of those questions.
+
+Each question is copied from the export's own XML, so its type, points, choices, answer key, and feedback come across as they were. Pictures in questions are packed with them, under their original file identity. The banks and questions get new ids, the same ones on every run, so importing the file twice updates the banks instead of making second copies.
+
+Left out, with a note in the output: New Quizzes, whose item banks are imported a different way, and questions Canvas exported with the type "Error", which hold only their text. Try the import in a sandbox course first.
 
 ## Comparing two quizzes or banks
 

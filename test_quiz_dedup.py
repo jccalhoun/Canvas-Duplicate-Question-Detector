@@ -1792,6 +1792,87 @@ class Comparison(ExportCase):
         self.assertTrue(os.path.exists(page))
 
 
+class BankExport(ExportCase):
+    """--export-banks: a Canvas course export package with one bank per
+    Classic quiz, holding the quiz's questions that are in no bank as is."""
+    Q1, Q3, Q5 = OrphanBanks.Q1, OrphanBanks.Q3, OrphanBanks.Q5
+    Q5_REWORDED, Q6 = QuizCoverageCheck.Q5_REWORDED, QuizCoverageCheck.Q6
+
+    def course(self):
+        broken = item(MC, "Drag the steps into order", CHOICES, [CHOICES[0]]).replace(
+            "<fieldentry>multiple_choice_question</fieldentry>", "<fieldentry>Error</fieldentry>")
+        return {
+            "non_cc_assessments/gb.xml.qti": bank("gb", "Bank", [item(*self.Q1), item(*self.Q5)]),
+            "non_cc_assessments/gq.xml.qti": quiz("gq", "Old quiz", [
+                item(*self.Q1), item(*self.Q3), item(*self.Q3), item(*self.Q5_REWORDED), item(*self.Q6), broken],
+                bank_refs=[]),
+            "non_cc_assessments/gn.xml.qti": quiz("gn", "New one", [item(*self.Q6, new=True)], new=True),
+            "non_cc_assessments/gd.xml.qti": quiz("gd", "Done quiz", [item(*self.Q1)]),
+        }
+
+    def run_export(self):
+        path = self.export(self.course())
+        out, target = os.path.join(self.dir, "report.html"), os.path.join(self.dir, "banks.imscc")
+        printed = io.StringIO()
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out, "--export-banks", target]), \
+                contextlib.redirect_stdout(printed):
+            qd.main()
+        return path, target, printed.getvalue()
+
+    def test_package_holds_the_questions_not_in_a_bank(self):
+        path, target, printed = self.run_export()
+        self.assertIn("Bank export written to", printed)
+        self.assertIn("1 bank, 3 questions", printed)
+        self.assertIn("1 New Quiz with questions in no bank left out", printed)
+        self.assertIn("1 question Canvas could not export (type Error) left out", printed)
+        with zipfile.ZipFile(target) as z:
+            names = z.namelist()
+            self.assertIn("imsmanifest.xml", names)
+            self.assertIn("course_settings/canvas_export.txt", names)
+            manifest = z.read("imsmanifest.xml").decode()
+            (bank_file,) = [n for n in names if n.startswith("non_cc_assessments/")]
+            self.assertIn(f'href="{bank_file}"', manifest)
+            xml = z.read(bank_file).decode()
+        self.assertIn("<fieldentry>Old quiz (questions not in a bank)</fieldentry>", xml)
+        self.assertNotIn("assessment_question_identifierref", xml)
+        # read back by the script itself: Q3 once, Q6, and the quiz's reworded Q5; Q1 is already in a bank
+        questions, _, _, containers = qd.collect_questions([target])
+        self.assertEqual([c.title for c in containers if c.kind == "bank"], ["Old quiz (questions not in a bank)"])
+        self.assertEqual(sorted(q.text for q in questions), sorted([self.Q3[1], self.Q5_REWORDED[1], self.Q6[1]]))
+        self.assertEqual({q.source_kind for q in questions}, {"bank"})
+        q6 = next(q for q in questions if q.text == self.Q6[1])
+        self.assertEqual((q6.choices, q6.correct, q6.question_type), (self.Q6[2], self.Q6[3], MC))
+        originals = {q.item_id for q in qd.collect_questions([path])[0]}
+        self.assertFalse({q.item_id for q in questions} & originals)  # fresh idents
+
+    def test_pictures_go_with_their_questions(self):
+        stem = '<img src="$IMS-CC-FILEBASE$/Uploaded%20Media/slide.png?canvas_download=1" alt="x"> What is wrong here?'
+        path = self.export({"non_cc_assessments/gq.xml.qti": quiz("gq", "Slides quiz", [
+            item(MC, stem, CHOICES, [CHOICES[0]])])})
+        with zipfile.ZipFile(path, "a") as z:
+            z.writestr("web_resources/Uploaded Media/slide.png", b"PNGDATA")
+            z.writestr("imsmanifest.xml", '<manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">'
+                       '<resources><resource identifier="gpic" type="webcontent" '
+                       'href="web_resources/Uploaded Media/slide.png"/></resources></manifest>')
+        out, target = os.path.join(self.dir, "report.html"), os.path.join(self.dir, "banks.imscc")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out, "--export-banks", target]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with zipfile.ZipFile(target) as z:
+            self.assertEqual(z.read("web_resources/Uploaded Media/slide.png"), b"PNGDATA")
+            manifest = z.read("imsmanifest.xml").decode()
+        # the picture keeps its export identity, so it maps to the course's existing file
+        self.assertIn('identifier="gpic" href="web_resources/Uploaded Media/slide.png"', manifest)
+
+    def test_idents_are_stable_between_runs(self):
+        _, target, _ = self.run_export()
+        with zipfile.ZipFile(target) as z:
+            first = sorted(z.namelist())
+        _, target, _ = self.run_export()
+        with zipfile.ZipFile(target) as z:
+            self.assertEqual(sorted(z.namelist()), first)
+
+
 class Scoring(unittest.TestCase):
     def test_numbers_keep_their_sign_and_shape(self):
         forms = ["5", "-5", ".5", "1.5", "15", "1-5", "\u22125"]
