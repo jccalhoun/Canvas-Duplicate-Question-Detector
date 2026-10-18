@@ -2676,8 +2676,11 @@ FILE_REF_RE = re.compile(r"""\b(?:src|href)\s*=\s*(?:"([^"]*)"|'([^']*)')""", re
 def item_files(item):
     """Export file paths (under web_resources/) that an item's question HTML
     refers to, in any of the spellings image matching reads (see
-    export_path()). Paths that climb out of web_resources/ are dropped."""
-    text = " ".join(item.itertext())
+    export_path()). Paths that climb out of web_resources/ are dropped.
+    The item is read as serialised XML, so both escaped HTML in a mattext
+    and markup written as XML elements are seen (ElementTree leaves quotes in
+    text unescaped, so attribute values in escaped HTML stay readable)."""
+    text = ET.tostring(item, encoding="unicode")
     paths = set()
     for a, b in FILE_REF_RE.findall(text):
         src = urllib.parse.unquote(html.unescape(a or b)).split("?")[0].split("#")[0]
@@ -2687,7 +2690,7 @@ def item_files(item):
     return paths
 
 
-def manifest_files(files):
+def manifest_files(files):  # keys use the archive's own spelling, as ExportFiles.canonical() gives
     """{file path: manifest resource identifier} for the export's files, so
     a copied picture keeps its identity and maps to the course's existing file."""
     data = files.read("imsmanifest.xml")
@@ -2700,7 +2703,8 @@ def manifest_files(files):
     out = {}
     for res in root.iter():
         if local(res.tag) == "resource" and res.get("href"):
-            out[urllib.parse.unquote(res.get("href"))] = res.get("identifier")
+            href = urllib.parse.unquote(res.get("href"))
+            out[files.canonical(href) or href] = res.get("identifier")
     return out
 
 

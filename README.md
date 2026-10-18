@@ -191,7 +191,7 @@ The statuses can be checked against the Unused Classic Quiz Bank Checker: its *U
 The second section answers one question for every quiz that has questions of its own: which banks already hold them? Each quiz gets a sentence or two:
 
 - **Has the same questions as the bank X.** The quiz's questions could be replaced with a question group that picks all of them from that bank. This needs the bank to hold nothing else: a question it holds twice, or one left out by `--exclude-type`, makes it a bigger bank, since a question group could draw those.
-- **Every question is in the bank X**, which also has some other questions.
+- **Every question is in the bank X**, which holds more questions in all (others, repeats, or ones left out by `--exclude-type`).
 - **Every question is in a bank, spread over N banks**, with how many each bank adds. The fewest banks that cover the quiz are picked, preferring a bank a quiz already links to, then the smallest.
 - How many questions are in a bank **only as a reworded version**, and how many are in **no bank**.
 
