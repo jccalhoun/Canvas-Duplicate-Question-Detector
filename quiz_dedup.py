@@ -71,6 +71,22 @@ IMG_ATTR_RE = re.compile(r"""\b(src|alt)\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.I)
 FILEBASE = "$IMS-CC-FILEBASE$/"  # how an export refers to a file it carries under web_resources/
 
 
+def export_path(src):
+    """The path inside the export ("web_resources/...") that a file
+    reference in question HTML points at, or None when it points elsewhere.
+    `src` is already entity-decoded and unquoted. Takes $IMS-CC-FILEBASE$/,
+    its underscore spelling and web_resources/, with any leading ../"""
+    local = src
+    while local.startswith("../"):
+        local = local[3:]
+    for base in (FILEBASE, "$IMS_CC_FILEBASE$/"):
+        if local.startswith(base):
+            return "web_resources/" + local[len(base):]
+    if local.lower().startswith("web_resources/"):
+        return local
+    return None
+
+
 class ImageStore:
     """Names question images by what they contain.
 
@@ -113,14 +129,7 @@ class ImageStore:
 
     def name(self, src, fallback):
         """The name to show and compare for an image, given its src."""
-        rel, local = None, src
-        while local.startswith("../"):
-            local = local[3:]
-        for base in (FILEBASE, "$IMS_CC_FILEBASE$/"):
-            if local.startswith(base):
-                rel = "web_resources/" + local[len(base):]
-        if rel is None and local.lower().startswith("web_resources/"):
-            rel = local
+        rel = export_path(src)
         if rel is None and "://" in src:
             # a web address is known by its host and path, so graph.png on two
             # sites is two pictures. The query string is left out: Canvas adds
@@ -1610,6 +1619,15 @@ class QuizCoverage:
         return picked
 
 
+def bank_item_counts(containers):
+    """{(export, bank id): questions the bank holds in the export}. This is the
+    count a question group draws from, so it includes questions an
+    --exclude-type filter left out of the comparison and any question the
+    bank holds twice: a quiz has "the same questions" as a bank only when the
+    bank holds nothing else."""
+    return {(c.source_file, c.cid): c.item_count for c in containers if c.kind == "bank"}
+
+
 def quiz_coverage(variants, containers, cluster_of, audit):
     """A QuizCoverage for every quiz that stores questions of its own.
     `cluster_of` maps id(variant) to its modified-question group number and
@@ -2135,7 +2153,7 @@ def build_json_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
         out = ref(cov.quiz)
         stem = lambda i: ctx["variants"][i].rep.text
         banks = lambda keys: [{"id": k[1], "title": bank_titles.get(k)} for k in keys]
-        sizes = {k: held for k, (held, _, _) in spread.items()}
+        sizes = bank_item_counts(containers)
         cover = cov.cover(sizes)
         same = (cover[0][0] if len(cover) == 1 and len(cov.banks) == cov.distinct
                 and sizes.get(cover[0][0], 0) <= cov.distinct else None)
@@ -2563,7 +2581,8 @@ CANVAS_EXPORT_FLAG = "course_settings/canvas_export.txt"
 
 def new_ident(*parts):
     """A fresh Canvas-style ident ("g" + 32 hex), stable for the same inputs,
-    so importing the same file twice updates the banks instead of doubling them."""
+    so importing the bank export again, even one made from a later export of
+    the course, updates the banks instead of doubling them."""
     return "g" + hashlib.md5("\x00".join(("quiz_dedup bank export",) + parts).encode("utf-8")).hexdigest()
 
 
@@ -2605,8 +2624,12 @@ class ExportFiles:
                           for d, _, files in os.walk(path) for f in files]
         self.lower = {n.lower(): n for n in self.names}
 
+    def canonical(self, name):
+        """The archive's own spelling of `name`, matched without regard to case, or None."""
+        return self.lower.get(name.lower())
+
     def read(self, name):
-        name = self.lower.get(name.lower())
+        name = self.canonical(name)
         if name is None:
             return None
         if self.zip:
@@ -2647,13 +2670,20 @@ def find_items(files, wanted):
     return found
 
 
+FILE_REF_RE = re.compile(r"""\b(?:src|href)\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.I)
+
+
 def item_files(item):
-    """Export file paths (under web_resources/) that an item's text refers to."""
-    text = "".join(item.itertext()) + "".join(v for el in item.iter() for v in el.attrib.values())
+    """Export file paths (under web_resources/) that an item's question HTML
+    refers to, in any of the spellings image matching reads (see
+    export_path()). Paths that climb out of web_resources/ are dropped."""
+    text = " ".join(item.itertext())
     paths = set()
-    for base in (FILEBASE, "$IMS_CC_FILEBASE$/"):
-        for m in re.finditer(re.escape(base) + r"""([^"'<>\s?#]+)""", text):
-            paths.add("web_resources/" + urllib.parse.unquote(m.group(1)))
+    for a, b in FILE_REF_RE.findall(text):
+        src = urllib.parse.unquote(html.unescape(a or b)).split("?")[0].split("#")[0]
+        rel = export_path(src)
+        if rel and ".." not in rel.split("/"):
+            paths.add(rel)
     return paths
 
 
@@ -2684,7 +2714,7 @@ def write_bank_export(path, wanted_banks, sources, labels):
     for quiz, idents in wanted_banks:
         by_source.setdefault(quiz.source_file, []).append((quiz, idents))
     path_of = dict(zip(labels, sources))
-    banks, short, written, resources = [], [], 0, {}
+    banks, short, written, resources, used_ids = [], [], 0, {}, set()
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as out:
         for label, quizzes in by_source.items():
             files = ExportFiles(path_of[label])
@@ -2692,7 +2722,12 @@ def write_bank_export(path, wanted_banks, sources, labels):
                 items = find_items(files, {q.cid: set(ids) for q, ids in quizzes})
                 known = manifest_files(files)
                 for quiz, idents in quizzes:
-                    bank_id = new_ident(label, quiz.cid)
+                    # from the quiz's Canvas id alone, which stays the same from one export of the
+                    # course to the next (the export's file name does not)
+                    bank_id = new_ident(quiz.cid)
+                    if bank_id in used_ids:  # the same course passed twice
+                        bank_id = new_ident(label, quiz.cid)
+                    used_ids.add(bank_id)
                     ns = QTI_NS
                     root = ET.Element(f"{{{ns}}}questestinterop")
                     bank = ET.SubElement(root, f"{{{ns}}}objectbank", ident=bank_id)
@@ -2708,7 +2743,7 @@ def write_bank_export(path, wanted_banks, sources, labels):
                         if el is None:
                             continue
                         copy = ET.fromstring(ET.tostring(el))
-                        copy.set("ident", new_ident(label, quiz.cid, ident))
+                        copy.set("ident", new_ident(bank_id, ident))
                         # the link back to the bank question it came from would point at nothing
                         for meta_el in list(copy.iter()):
                             for f in list(meta_el):
@@ -2718,11 +2753,12 @@ def write_bank_export(path, wanted_banks, sources, labels):
                                     meta_el.remove(f)
                         bank.append(copy)
                         count += 1
-                        for name in item_files(copy):
-                            data = files.read(name)
-                            if data is not None and name not in resources:
-                                out.writestr(name, data)
-                                resources[name] = known.get(name) or new_ident(label, name)
+                        for wanted_name in item_files(copy):
+                            name = files.canonical(wanted_name)  # the spelling the manifest uses
+                            if name is None or name in resources:
+                                continue
+                            out.writestr(name, files.read(name))
+                            resources[name] = known.get(name) or new_ident(name)
                     if count < len(idents):
                         short.append((quiz.title, len(idents) - count))
                     if count:
@@ -3284,7 +3320,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
     coverage = ctx.get("quiz_coverage", [])
     bank_info = {(b.bank.source_file, b.bank.cid): b for b in audit}
     bank_titles = {(c.source_file, c.cid): c.title for c in ctx["containers"] if c.kind == "bank"}
-    bank_sizes = {k: held for k, (held, _, _) in spread.items()}
+    bank_sizes = bank_item_counts(ctx["containers"])
 
     def bank_name(key, strong=True):
         b = bank_info.get(key)
@@ -3330,8 +3366,8 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                 lines.append(f"Has the same questions as the bank {bank_name(key)}. Its questions could be "
                              f"replaced with a question group that picks all {cov.distinct} from that bank.")
             else:
-                lines.append(f"Every question is in the bank {bank_name(key)}, which also has "
-                             f"{plural(extra, 'other question')}.")
+                lines.append(f"Every question is in the bank {bank_name(key)}, which holds "
+                             f"{plural(bank_sizes.get(key, 0), 'question')} in all.")
         elif in_bank:
             shown = cover[:5]
             parts = [f"{bank_name(k)} ({added})" for k, added in shown]
@@ -3762,7 +3798,7 @@ def main():
     print(f"  Quiz coverage: {len(coverage) - gaps} of {plural(len(coverage), 'quiz', 'quizzes')} "
           "have every question in a bank unchanged")
 
-    ctx = {"show_source": len({q.source_file for q in questions}) > 1, "bank_usage": bank_usage,
+    ctx = {"show_source": len(args.sources) > 1, "bank_usage": bank_usage,
            "excluded_note": excluded_note, "min_overlap": args.word_overlap,
            "too_big": too_big_list, "max_questions": args.max_questions,
            "container_overlap": args.container_overlap, "containers": containers,
@@ -3802,9 +3838,7 @@ def main():
             json.dump(data, f, indent=2, ensure_ascii=False)
         print(f"JSON written to {args.json}")
     if args.plan:
-        sizes = {key: held for key, (held, _, _) in bank_spread(variants, [b.bank for b in bank_audit],
-                                                                 cluster_of).items()}
-        plan = build_plan(variants, coverage, bank_audit, sizes, ctx["show_source"])
+        plan = build_plan(variants, coverage, bank_audit, bank_item_counts(containers), ctx["show_source"])
         write_plan(args.plan, plan, export_labels(args.sources), args.max_questions)
         print(f"Action plan written to {args.plan}")
     if args.export_banks:
