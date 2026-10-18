@@ -61,6 +61,7 @@ python3 quiz_dedup.py fall.imscc spring.imscc -o report.html
 | `--container-overlap` | `80` | List a quiz or bank as mostly contained in another when at least this percent of its questions are also there |
 | `--exclude-type TYPE` | (none) | Skip a question type, such as `essay_question`. Can be repeated. |
 | `--exclude-title TEXT` | (none) | Skip quizzes and banks whose title contains `TEXT` (case-insensitive). Can be repeated. |
+| `--max-questions N` | (none) | Skip quizzes and banks holding more than `N` questions (see *Leaving out large quizzes and banks*) |
 | `--only-published` | off | In the bank orphan check, count only published quizzes as using a bank or holding a question |
 
 The fixed rules behind the threshold (see *How matching works*) can also be changed, with `--loose-stem`, `--choices-floor`, `--both-margin`, `--loose-choices`, `--stem-only-min` and `--min-container`. `--help` lists their defaults. They were tuned on real exports, so change them one at a time and compare reports.
@@ -69,7 +70,20 @@ Lower the threshold to catch heavier rewrites; raise it if unrelated questions a
 
 If questions about different things are being grouped, raise `--word-overlap` (try 70). If reworded questions you know about are missing, lower it (try 40). At 0 the check is off. At 100, differently worded stems only match when one is the other plus added words.
 
-Questions removed with `--exclude-type` or `--exclude-title` are dropped before anything is counted, so the totals in the report cover only what was compared. A quiz whose questions were all excluded is not listed as empty, and a bank question a quiz uses is not reported as missing because it was excluded. A bank removed with `--exclude-title` is shown by name as excluded where a quiz draws from it, and what a quiz takes from excluded banks or excluded questions is left out when quizzes are compared with each other. The report header says how many were excluded. `--help` lists the Canvas question type names.
+Questions removed with `--exclude-type` or `--exclude-title` are dropped before anything is counted, so the totals in the report cover only what was compared. A quiz whose questions were all excluded is not listed as empty, and a bank question a quiz uses is not reported as missing because it was excluded. A bank removed with `--exclude-title` or `--max-questions` is shown by name, with the option that left it out, where a quiz draws from it, and what a quiz takes from excluded banks or excluded questions is left out when quizzes are compared with each other. The report header says how many were excluded. `--help` lists the Canvas question type names.
+
+### Leaving out large quizzes and banks
+
+```
+python3 quiz_dedup.py export.imscc -o report.html --max-questions 100
+```
+
+`--max-questions N` leaves out every quiz and bank holding more than `N` questions in the export, the same way `--exclude-title` leaves out the ones it names. Use it to set aside large banks you are keeping, such as a publisher test bank, and see only whether the smaller quizzes and banks duplicate each other. The count is the questions stored in the quiz or bank, so a quiz that only draws from banks holds none and is always kept. The output lists what was left out, and the report shows the same list, folded, under its summary.
+
+Leaving a bank out means its questions are not looked at at all:
+
+- A small bank whose questions are also in a large bank is not shown as contained in it, and its questions can look unique. The bank check only becomes more cautious this way, never less: a copy in a left-out bank never makes another bank look safe to delete.
+- In the quiz coverage section, the action plan and `--export-banks`, a question that is only in a left-out bank counts as being in no bank. Run without `--max-questions` before putting questions into new banks, or the new banks may repeat questions the large banks already hold. The plan and the bank export both carry a reminder when the option was used.
 
 ## Reading the report
 
@@ -140,7 +154,7 @@ The first section of the report answers one question for every bank: can it be d
 - **copied only**: no quiz links to the bank, but Classic quiz questions were copied from it. The export marks each such quiz question with the bank question it came from (`assessment_question_identifierref`). The quizzes hold their own copies, so they do not need the bank.
 - **unused**: neither.
 
-Usage counts every quiz in the export, including quizzes left out of the comparison with `--exclude-title`: excluding a quiz from the comparison does not stop it using its banks. Unpublished quizzes count too, unless you pass `--only-published`.
+Usage counts every quiz in the export, including quizzes left out of the comparison with `--exclude-title` or `--max-questions`: excluding a quiz from the comparison does not stop it using its banks. Unpublished quizzes count too, unless you pass `--only-published`.
 
 **Verdict.** For a bank that is not linked, each of its questions is first sorted by where else it is found in the same export:
 

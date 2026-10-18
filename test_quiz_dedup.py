@@ -914,7 +914,7 @@ class ReviewFixes2(ExportCase):
                  "non_cc_assessments/q1.xml.qti": quiz("q1", "Quiz one", items, draws=[("gx", 1)]),
                  "non_cc_assessments/q2.xml.qti": quiz("q2", "Quiz two", items, draws=[("gy", 1)])}
         report, data, _ = self.main(files, "--exclude-title", "pool")
-        self.assertIn("draws from banks excluded by --exclude-title were not compared", report)
+        self.assertIn("draws from banks left out of the comparison were not compared", report)
         quiz_one = next(c for c in data["quizzes_and_banks"] if c["title"] == "Quiz one")
         self.assertEqual(quiz_one["draws_from_excluded_banks"], 1)
 
@@ -1239,7 +1239,7 @@ class ReviewFixes(ExportCase):
             report = f.read()
         self.assertIn([["Exam", "fall.imscc"], ["Exam", "spring.imscc"]],
                       [sorted([c["title"], c["export"]] for c in g) for g in data["identical_quizzes_and_banks"]])
-        self.assertIn("Hidden pool <span class='src'>(excluded by --exclude-title)</span>", report)
+        self.assertIn("Hidden pool <span class='src'>(left out by --exclude-title)</span>", report)
         self.assertNotIn("a bank that is not in this export", report)
         exam = next(c for c in data["quizzes_and_banks"] if c["title"] == "Exam")
         self.assertEqual(exam["draws"][0]["bank_title"], "Hidden pool")
@@ -1877,6 +1877,65 @@ class BankExport(ExportCase):
         _, target, _ = self.run_export()
         with zipfile.ZipFile(target) as z:
             self.assertEqual(sorted(z.namelist()), first)
+
+
+class MaxQuestions(ExportCase):
+    """--max-questions N leaves out quizzes and banks holding more than N
+    questions, so the smaller ones can be compared on their own."""
+    QS = [OrphanBanks.Q1, OrphanBanks.Q2, OrphanBanks.Q3, OrphanBanks.Q4, OrphanBanks.Q5]
+
+    def course(self):
+        q1, q2, q3 = self.QS[:3]
+        return {
+            "non_cc_assessments/gbig.xml.qti": bank("gbig", "Publisher bank", [item(*q) for q in self.QS]),
+            "non_cc_assessments/gqbig.xml.qti": quiz("gqbig", "Big final", [item(*q) for q in self.QS[:4]]),
+            "non_cc_assessments/ga.xml.qti": bank("ga", "Small A", [item(*q1), item(*q2), item(*q3)]),
+            "non_cc_assessments/gb.xml.qti": bank("gb", "Small B", [item(*q1), item(*q2), item(*q3)]),
+            "non_cc_assessments/gq.xml.qti": quiz("gq", "Unit quiz", [], bank_refs=["ga", "gbig"]),
+        }
+
+    def run_main(self, *extra):
+        path = self.export(self.course())
+        out, target = os.path.join(self.dir, "report.html"), os.path.join(self.dir, "report.json")
+        printed = io.StringIO()
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out, "--json", target, *extra]), \
+                contextlib.redirect_stdout(printed):
+            qd.main()
+        with open(out, encoding="utf-8") as f, open(target, encoding="utf-8") as g:
+            return f.read(), json.load(g), printed.getvalue()
+
+    def test_large_quizzes_and_banks_are_left_out(self):
+        report, data, printed = self.run_main("--max-questions", "3")
+        titles = {c["title"] for c in data["quizzes_and_banks"]}
+        self.assertEqual(titles, {"Small A", "Small B", "Unit quiz"})  # the draw-only quiz holds none, so stays
+        self.assertEqual(data["summary"]["questions"], 6)
+        self.assertEqual(data["settings"]["max_questions"], 3)
+        self.assertEqual([(c["title"], c["questions"]) for c in data["left_out_by_max_questions"]],
+                         [("Publisher bank", 5), ("Big final", 4)])
+        self.assertIn("Left out for holding more than 3 questions (--max-questions): 2 quizzes and banks.", printed)
+        self.assertIn("[bank] Publisher bank (5)", printed)
+        # the two small banks are still found to be the same
+        (group,) = data["identical_quizzes_and_banks"]
+        self.assertEqual(sorted(c["title"] for c in group), ["Small A", "Small B"])
+        # the report names what was left out, and the quiz still draws from the large bank
+        self.assertIn("2 quizzes and banks with more than 3 questions left out (--max-questions)", report)
+        self.assertIn("<strong>Publisher bank</strong> <span class='src'>(5 questions)", report)
+        self.assertIn("Publisher bank <span class='src'>(left out by --max-questions)</span>", report)
+        # Small A is linked; usage was worked out before anything was left out
+        self.assertEqual({b["title"]: b["status"] for b in data["bank_usage_audit"]},
+                         {"Small A": "linked", "Small B": "unused"})
+
+    def test_without_the_option_nothing_is_left_out(self):
+        report, data, _ = self.run_main()
+        self.assertEqual(len(data["quizzes_and_banks"]), 5)
+        self.assertEqual(data["left_out_by_max_questions"], [])
+        self.assertNotIn("--max-questions)</summary>", report)
+
+    def test_limit_must_be_positive(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            self.run_main("--max-questions", "0")
+        self.assertIn("--max-questions must be at least 1", err.getvalue())
 
 
 class Scoring(unittest.TestCase):

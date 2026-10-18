@@ -2176,6 +2176,8 @@ def build_json_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                             "compared_by_web_address": ctx["images"].by_address},
         "bank_usage_audit": [bank_audit(b) for b in ctx.get("bank_audit", [])],
         "quiz_coverage": [quiz_cov(cov) for cov in ctx.get("quiz_coverage", [])],
+        "left_out_by_max_questions": [{"export": src, "kind": kind_label(kind, engine), "title": title,
+                                       "questions": n} for kind, engine, title, n, src in ctx.get("too_big", [])],
         "quizzes_and_banks": [container(c) for c in sorted(
             containers, key=lambda c: (c.kind, c.title.lower(), c.source_file, c.cid))],
         "identical_quizzes_and_banks": [[container(c) for c in group] for group in identical_containers],
@@ -2370,7 +2372,7 @@ def build_plan(variants, coverage, audit, bank_sizes, show_source=False):
     return {"quizzes": quiz_rows, "banks": bank_rows, "questions": questions}
 
 
-def write_plan(path, plan, sources):
+def write_plan(path, plan, sources, max_questions=None):
     """Write the action plan to an Excel file with a tab each for how to use
     it, the quizzes, the banks safe to delete, and the questions to put in a
     bank."""
@@ -2407,6 +2409,11 @@ def write_plan(path, plan, sources):
         ("5. After a round of changes, export the course again and rerun with --plan. Finished work drops off "
          "and the plan gets shorter.", False),
     ]
+    if max_questions is not None:
+        lines += [("", False),
+                  (f"Made with --max-questions {max_questions}: quizzes and banks holding more than {max_questions} "
+                   "questions were left out. A question that is also in one of those large banks shows here as "
+                   "in no bank, so check them before putting questions into a new bank.", True)]
     for text, bold in lines:
         readme.append([text])
         if bold:
@@ -2782,7 +2789,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
             head = f"{len(group)} quizzes that pull the same number of questions from the same banks"
         excluded = ctx.get("excluded_banks", {})
         if any((c.source_file, b) in excluded for c in group for b, _ in c.draws):
-            head += (" <span class='src'>&mdash; draws from banks excluded by --exclude-title were not "
+            head += (" <span class='src'>&mdash; draws from banks left out of the comparison were not "
                      "compared, so these may still differ there</span>")
         identical_html += f"""
             <div class="match-group exact"{filter_attrs("identical", (c.title for c in group))}>
@@ -2805,7 +2812,8 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
             bank = banks.get((c.source_file, bank_id))
             if bank is None and (c.source_file, bank_id) in ctx.get("excluded_banks", {}):
                 title = ctx["excluded_banks"][(c.source_file, bank_id)]
-                return f"{esc(title)} <span class='src'>(excluded by --exclude-title)</span>"
+                why = ctx.get("excluded_why", {}).get((c.source_file, bank_id), "--exclude-title")
+                return f"{esc(title)} <span class='src'>(left out by {why})</span>"
             if bank is None:
                 return f"a bank that is not in this export <span class='src'>({esc(bank_id)})</span>"
             return (f"[{esc(kind_label('bank', bank.engine))}] {esc(bank.title)} "
@@ -3395,6 +3403,17 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
   {no_match("quiz-coverage")}
 """
 
+    too_big_html = ""
+    if ctx.get("too_big"):
+        rows = "".join(f"<li>[{esc(kind_label(kind, engine))}] <strong>{esc(title)}</strong> "
+                       f"<span class='src'>({plural(n, 'question')}){' ' + esc(src) if ctx['show_source'] else ''}"
+                       f"</span></li>" for kind, engine, title, n, src in ctx["too_big"])
+        too_big_html = (f"<details class='summary'><summary>{plural(len(ctx['too_big']), 'quiz or bank', 'quizzes and banks')} "
+                        f"with more than {ctx['max_questions']} questions left out (--max-questions)</summary>"
+                        f"<ul class='containers'>{rows}</ul><p>Their questions were not compared, so a question "
+                        "that is also in one of them counts here as being in no bank, and a quiz drawing from one "
+                        "of them still counts as using it.</p></details>")
+
     bank_summary = ""
     if audit:
         linked_n = sum(b.status == USED_LINKED for b in audit)
@@ -3454,6 +3473,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
     {len(repeated)} questions with a repeated choice.
     Threshold {threshold:g}, word overlap {ctx["min_overlap"]:g}. Generated {date.today().isoformat()}.{ctx.get("excluded_note", "")}{ctx.get("image_note", "")}
   </p>
+  {too_big_html}
 
   <div class="filter-bar" role="search">
     <div class="filter-row">
@@ -3574,6 +3594,10 @@ def main():
                          "read from assessment_meta.xml).")
     ap.add_argument("--exclude-title", action="append", default=[], metavar="TEXT",
                     help="Skip quizzes and banks whose title contains TEXT (case-insensitive). Repeatable.")
+    ap.add_argument("--max-questions", type=int, metavar="N",
+                    help="Skip quizzes and banks holding more than N questions in the export, as --exclude-title "
+                         "does, to look only at the smaller ones. A quiz that only draws from banks holds none, "
+                         "so it is kept.")
     tuning = ap.add_argument_group(
         "advanced matching settings",
         "The fixed rules behind --threshold. The defaults were tuned on real course exports; "
@@ -3586,6 +3610,8 @@ def main():
             n.lower() for n, _, _ in ADVANCED_SETTINGS if n != "MIN_CONTAINER"):
         if not 0 <= getattr(args, name) <= 100:
             ap.error(f"--{name.replace('_', '-')} must be between 0 and 100")
+    if args.max_questions is not None and args.max_questions < 1:
+        ap.error("--max-questions must be at least 1")
     if args.min_container < 1:
         ap.error("--min-container must be at least 1")
     # no output may overwrite an input export or another output
@@ -3628,23 +3654,40 @@ def main():
                       f"{images.by_address} by web address.")
         print(f" {image_note}")
     excluded_note = ""
-    excluded_banks = {}
-    if args.exclude_type or args.exclude_title:
+    excluded_banks, excluded_why = {}, {}
+    too_big_list = []
+    titles = [t.lower() for t in args.exclude_title]
+    # quizzes and banks left out by title or by size, as (export, kind, id)
+    too_big = ({(c.source_file, c.kind, c.cid) for c in containers if c.item_count > args.max_questions}
+               if args.max_questions is not None else set())
+    left_out = lambda c: (c.source_file, c.kind, c.cid) in too_big or any(t in c.title.lower() for t in titles)
+    if args.exclude_type or titles or too_big:
         types = {t.lower() for t in args.exclude_type}
-        titles = [t.lower() for t in args.exclude_title]
+        dropped = {(c.source_file, c.kind, c.cid) for c in containers if left_out(c)}
         kept = [q for q in questions
                 if q.question_type.lower() not in types
+                and (q.source_file, q.source_kind, q.quiz_id) not in dropped
                 and not any(t in q.quiz_title.lower() for t in titles)]
         excluded_note = f" {len(questions) - len(kept)} questions excluded by filters."
+        if too_big:
+            excluded_note += (f" Left out for holding more than {args.max_questions} questions "
+                              f"(--max-questions): {plural(len(too_big), 'quiz or bank', 'quizzes and banks')}.")
+            too_big_list = sorted(((c.kind, c.engine, c.title, c.item_count, c.source_file) for c in containers
+                                   if (c.source_file, c.kind, c.cid) in too_big), key=lambda r: (-r[3], r[2].lower()))
         print(f" {excluded_note.strip()}")
+        for kind, engine, title, n, _ in too_big_list:
+            print(f"    [{kind_label(kind, engine)}] {title} ({n})")
         questions = kept
-        if titles:
-            hidden = lambda title: any(t in title.lower() for t in titles)
-            excluded_banks = {(c.source_file, c.cid): c.title for c in containers
-                              if c.kind == "bank" and hidden(c.title)}
-            containers = [c for c in containers if not hidden(c.title)]
-            bank_usage = {k: {t for t in v if not hidden(t)} for k, v in bank_usage.items()}
-            unresolved = [u for u in unresolved if not hidden(u[1])]
+        if dropped:
+            excluded_banks = {(c.source_file, c.cid): c.title for c in containers if c.kind == "bank" and left_out(c)}
+            excluded_why = {(c.source_file, c.cid): "--max-questions" if (c.source_file, c.kind, c.cid) in too_big
+                            else "--exclude-title" for c in containers if c.kind == "bank" and left_out(c)}
+            # a title is hidden where it names only quizzes and banks that were left out
+            shown = {(c.source_file, c.title) for c in containers if not left_out(c)}
+            gone = {(c.source_file, c.title) for c in containers if left_out(c)} - shown
+            containers = [c for c in containers if not left_out(c)]
+            bank_usage = {k: {t for t in v if (k[0], t) not in gone} for k, v in bank_usage.items()}
+            unresolved = [u for u in unresolved if (u[0], u[1]) not in gone]
     kept_items = Counter((q.source_file, q.quiz_id) for q in questions if q.source_kind == "bank")
     excluded_items = {key: n - kept_items.get(key, 0) for key, n in bank_items.items() if n > kept_items.get(key, 0)}
     quizzes = [c for c in containers if c.kind == "quiz"]
@@ -3721,9 +3764,11 @@ def main():
 
     ctx = {"show_source": len({q.source_file for q in questions}) > 1, "bank_usage": bank_usage,
            "excluded_note": excluded_note, "min_overlap": args.word_overlap,
+           "too_big": too_big_list, "max_questions": args.max_questions,
            "container_overlap": args.container_overlap, "containers": containers,
            "engine_note": engine_note, "draw_note": draw_note, "picked_by": picked_by,
            "images": images, "image_note": image_note, "excluded_banks": excluded_banks,
+           "excluded_why": excluded_why,
            "variants": variants, "bank_audit": bank_audit, "refs_seen": refs_seen,
            "refs_resolved": refs_resolved, "cluster_of": cluster_of, "only_published": args.only_published,
            "classic_quiz_items": classic_quiz_items, "quiz_coverage": coverage}
@@ -3748,6 +3793,7 @@ def main():
                     "threshold": args.threshold,
                     "word_overlap": args.word_overlap, "container_overlap": args.container_overlap,
                     "exclude_type": list(args.exclude_type), "exclude_title": list(args.exclude_title),
+                    "max_questions": args.max_questions,
                     "only_published": args.only_published,
                     **{n.lower(): getattr(args, n.lower()) for n, _, _ in ADVANCED_SETTINGS}}
         data = build_json_report(clusters, lookalikes, exact_variants, unrelated_groups, same_choice_groups,
@@ -3759,7 +3805,7 @@ def main():
         sizes = {key: held for key, (held, _, _) in bank_spread(variants, [b.bank for b in bank_audit],
                                                                  cluster_of).items()}
         plan = build_plan(variants, coverage, bank_audit, sizes, ctx["show_source"])
-        write_plan(args.plan, plan, export_labels(args.sources))
+        write_plan(args.plan, plan, export_labels(args.sources), args.max_questions)
         print(f"Action plan written to {args.plan}")
     if args.export_banks:
         wanted = banks_to_export(coverage, variants)
@@ -3768,6 +3814,9 @@ def main():
                      for i in list(cov.missing) + list(cov.modified) if variants[i].rep.question_type == "Error")
         n_banks, n_questions, short = write_bank_export(args.export_banks, wanted, args.sources,
                                                         export_labels(args.sources))
+        if args.max_questions is not None:
+            print(f"  ! made with --max-questions {args.max_questions}: questions also in a larger bank were "
+                  "taken for questions in no bank and may already be in one", file=sys.stderr)
         print(f"Bank export written to {args.export_banks}: {plural(n_banks, 'bank')}, "
               f"{plural(n_questions, 'question')}")
         for title, n in short:
