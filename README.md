@@ -216,7 +216,7 @@ To import it:
 3. Choose **Select specific content**, then pick the banks you want under Question Banks. You can import just one to try it.
 4. The new banks appear under **Quizzes → Manage Question Banks**. Point the quiz at its bank with a question group, then delete the quiz's own copies of those questions.
 
-Quizzes that share a title get the same `#` number in their bank's name as in the report and the plan. If two exports passed together hold different pictures under the same path, the first one is packed and a warning names the file. Each question is copied from the export's own XML, so its type, points, choices, answer key, and feedback come across as they were. Pictures in questions are packed with them, under their original file identity. The banks and questions get new ids made from the quiz's Canvas id, so they are the same on every run, even from a later export of the course saved under another file name: importing again updates the banks instead of making second copies.
+Quizzes that share a title get the same `#` number in their bank's name as in the report and the plan. If two exports passed together hold different pictures under the same path, the second is packed in a folder of its own and its question is pointed at it, so each bank shows its own picture. Each question is copied from the export's own XML, so its type, points, choices, answer key, and feedback come across as they were. Pictures in questions are packed with them, under their original file identity. The banks and questions get new ids made from the quiz's Canvas id, so they are the same on every run, even from a later export of the course saved under another file name: importing again updates the banks instead of making second copies.
 
 Left out, with a note in the output: New Quizzes, whose item banks are imported a different way, and questions Canvas exported with the type "Error", which hold only their text. Try the import in a sandbox course first.
 
@@ -252,6 +252,8 @@ The report answers "what is duplicated where". The action plan answers "what do 
   - **Step 2, inside a bigger bank**: every question is in one bank that has more. Draw at random from it, or copy the questions into a bank of their own.
   - **Step 3, spread over banks**: copy the questions into one new bank and use one question group.
   - **Step 4, put questions in a bank first**: some questions are in no bank, or only as a reworded version. A quiz whose missing questions are all essay, numerical and similar types is flagged as possibly an assignment you would rather leave alone.
+
+  A step 1 to 3 row starts with **Check first** when deleting the quiz's questions would touch more than the report compared: questions left out with `--exclude-type` (keep those), or a question the quiz holds more than once (a question group then gives fewer questions). The report's quiz card says the same.
 
   The **Keep** column names banks to keep until the quiz is done: some of its questions are in no bank that will stay (linked, kept as the one copy, or about to be drawn from by the plan).
 - **Banks**: the banks the bank check calls safe to delete, with why, and whether to go ahead. **yes** means delete it. **wait** means some of its questions are otherwise only in quizzes you have not finished, and in no bank that will stay; it names those quizzes. **no** means the plan has a quiz draw from it, so it will be in use.

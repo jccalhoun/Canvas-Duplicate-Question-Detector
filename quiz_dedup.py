@@ -1611,6 +1611,23 @@ class QuizCoverage:
     missing: list = field(default_factory=list)     # in no bank, in any version
     banks: dict = field(default_factory=dict)       # {variant index: [(export, bank id)]} for every question in a bank as is
     linked_banks: set = field(default_factory=set)  # (export, bank id) of the linked banks among them
+    records: int = 0        # questions stored in the quiz that were compared, repeats counted
+    not_compared: int = 0   # questions stored in the quiz that a filter (--exclude-type) left out
+
+    def caveats(self):
+        """Sentences saying what deleting the quiz's questions would also
+        touch: questions left out of the comparison, which must be kept, and
+        questions the quiz holds more than once."""
+        out = []
+        if self.not_compared:
+            n = self.not_compared
+            out.append(f"It also has {plural(n, 'question')} left out of the comparison (--exclude-type); "
+                       f"{'it is' if n == 1 else 'they are'} not covered here, so keep "
+                       f"{'it' if n == 1 else 'them'} when you delete the others.")
+        if self.records > self.distinct:
+            out.append(f"It holds {self.records} questions but only {self.distinct} different ones, so a question "
+                       f"group picking {self.distinct} gives students {plural(self.records - self.distinct, 'question')} fewer.")
+        return out
 
     def cover(self, bank_sizes):
         """The fewest banks that between them hold every question found in a
@@ -1658,6 +1675,9 @@ def quiz_coverage(variants, containers, cluster_of, audit):
         if not idxs:
             continue
         cov = QuizCoverage(c, len(idxs))
+        cov.records = sum(1 for i in idxs for q in variants[i].occurrences
+                          if q.source_kind == "quiz" and (q.source_file, q.quiz_id) == (c.source_file, c.cid))
+        cov.not_compared = max(0, c.item_count - cov.records)
         local_banks = lambda i: {k for k in banks_of[i] if k[0] == c.source_file}
         for i in sorted(idxs):
             banks = local_banks(i)
@@ -2345,6 +2365,11 @@ def build_plan(variants, coverage, audit, bank_sizes, show_source=False):
                                       f"Modified questions, group {group}"))
             for i in cov.missing:
                 question_rows.append((label, i, "In no bank", ""))
+        caveats = cov.caveats()
+        if caveats and step < 4:
+            action = "Check first. " + action + " " + " ".join(caveats)
+        elif caveats:
+            action += " " + " ".join(caveats)
         keep = sorted(keep_for_quiz(cov, bank_info, staying), key=lambda k: bank_label(k).lower())
         for k in keep:
             holds.setdefault(k, []).append(label)
@@ -2398,7 +2423,7 @@ def build_plan(variants, coverage, audit, bank_sizes, show_source=False):
     return {"quizzes": quiz_rows, "banks": bank_rows, "questions": questions}
 
 
-def write_plan(path, plan, sources, max_questions=None):
+def write_plan(path, plan, sources, max_questions=None, only_published=False):
     """Write the action plan to an Excel file with a tab each for how to use
     it, the quizzes, the banks safe to delete, and the questions to put in a
     bank."""
@@ -2429,12 +2454,18 @@ def write_plan(path, plan, sources, max_questions=None):
          "and those questions are gone.", False),
         (f"3. The Banks tab lists banks the bank check calls safe to delete. Delete only rows marked yes ({ready} "
          "now). Wait means some of its questions are otherwise only in quizzes you have not finished; "
-         "no means the plan has a quiz draw from it.", False),
+         "no means the plan has a quiz draw from it. A quiz in another course can also draw from a bank, "
+         "and this export cannot show that.", False),
         ("4. Banks not on the Banks tab hold questions found nowhere else, or need a look first. See the "
          "report's bank check.", False),
         ("5. After a round of changes, export the course again and rerun with --plan. Finished work drops off "
          "and the plan gets shorter.", False),
     ]
+    if only_published:
+        lines += [("", False),
+                  ("Made with --only-published: unpublished quizzes do not count as using a bank, so a bank used "
+                   "only by unpublished quizzes can be on the Banks tab as ready to delete. Deleting it breaks "
+                   "those quizzes.", True)]
     if max_questions is not None:
         lines += [("", False),
                   (f"Made with --max-questions {max_questions}: quizzes and banks holding more than {max_questions} "
@@ -2703,6 +2734,34 @@ def item_files(item):
     return paths
 
 
+FILE_ATTR_RE = re.compile(r"""\b(src|href)(\s*=\s*)(?:"([^"]*)"|'([^']*)')""", re.I)
+
+
+def point_files_at(item, moved, canonical):
+    """Rewrite the file references in an item's question HTML whose export
+    path (spelled as canonical() gives it) is a key of `moved`, to point at
+    the new path. Covers escaped HTML in text and markup written as XML."""
+    def swap(m):
+        value = m.group(3) if m.group(3) is not None else m.group(4)
+        src = urllib.parse.unquote(html.unescape(value)).split("?")[0].split("#")[0]
+        rel = export_path(src)
+        new = moved.get(canonical(rel)) if rel else None
+        if new is None:
+            return m.group(0)
+        ref = FILEBASE + urllib.parse.quote(new[len("web_resources/"):])
+        return f'{m.group(1)}{m.group(2)}"{ref}"'
+
+    for el in item.iter():
+        if el.text:
+            el.text = FILE_ATTR_RE.sub(swap, el.text)
+        if el.tail:
+            el.tail = FILE_ATTR_RE.sub(swap, el.tail)
+        for key, value in list(el.attrib.items()):
+            if local(key) in ("src", "href"):
+                fake = FILE_ATTR_RE.sub(swap, f'{key}="{value}"')
+                el.set(key, fake.split("=", 1)[1].strip().strip('"'))
+
+
 def manifest_files(files):  # keys use the archive's own spelling, as ExportFiles.canonical() gives
     """{file path: manifest resource identifier} for the export's files, so
     a copied picture keeps its identity and maps to the course's existing file."""
@@ -2732,7 +2791,7 @@ def write_bank_export(path, wanted_banks, sources, labels):
         by_source.setdefault(quiz.source_file, []).append((quiz, idents, title))
     path_of = dict(zip(labels, sources))
     banks, short, written, resources, used_ids = [], [], 0, {}, set()
-    written_files, written_from = {}, {}
+    written_files, renamed = {}, 0
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as out:
         for label, quizzes in by_source.items():
             files = ExportFiles(path_of[label])
@@ -2770,20 +2829,27 @@ def write_bank_export(path, wanted_banks, sources, labels):
                                     meta_el.remove(f)
                         bank.append(copy)
                         count += 1
+                        moved = {}
                         for wanted_name in item_files(copy):
                             name = files.canonical(wanted_name)  # the spelling the manifest uses
                             if name is None:
                                 continue
                             data = files.read(name)
-                            if name in resources:
-                                if written_files[name] != data:
-                                    print(f"  ! two exports have different files at {name}; the bank for "
-                                          f"\"{quiz.title}\" uses the one from {written_from[name]}, so check "
-                                          "its pictures after importing", file=sys.stderr)
+                            target = name
+                            if name in written_files and written_files[name] != data:
+                                # another export already packed a different file at this path: this
+                                # one goes in a folder of its own and the question is pointed at it
+                                target = (f"web_resources/from_{new_ident(label)[1:9]}/"
+                                          f"{name[len('web_resources/'):]}")
+                                moved[name] = target
+                            if target in written_files:
                                 continue
-                            written_files[name], written_from[name] = data, label
-                            out.writestr(name, data)
-                            resources[name] = known.get(name) or new_ident(name)
+                            written_files[target] = data
+                            out.writestr(target, data)
+                            resources[target] = (known.get(name) if target == name else None) or new_ident(label, target)
+                        if moved:
+                            point_files_at(copy, moved, files.canonical)
+                            renamed += len(moved)
                     if count < len(idents):
                         short.append((quiz.title, len(idents) - count))
                     if count:
@@ -2814,6 +2880,9 @@ def write_bank_export(path, wanted_banks, sources, labels):
         out.writestr("imsmanifest.xml", "\n".join(manifest))
         # Canvas recognises its own course export package by this file
         out.writestr(CANVAS_EXPORT_FLAG, "Made by quiz_dedup.py --export-banks.\n")
+    if renamed:
+        print(f"  {plural(renamed, 'picture')} from different exports shared a path with a different file; "
+              "each was packed in a folder of its own and its question points there")
     return len(banks), written, short
 
 
@@ -3412,6 +3481,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
         if cov.missing:
             lines.append("None of its questions are in a bank." if len(cov.missing) == cov.distinct else
                          f"{plural(len(cov.missing), 'question')} {are(len(cov.missing))} in no bank.")
+        lines += [f"<strong>{esc(t)}</strong>" for t in cov.caveats()]
 
         # ---- a bank the bank check calls safe to delete only because this quiz has copies of its questions
         safe = sorted(keep_for_quiz(cov, bank_info, staying), key=lambda k: bank_titles.get(k, "").lower())
@@ -3869,7 +3939,7 @@ def main():
         print(f"JSON written to {args.json}")
     if args.plan:
         plan = build_plan(variants, coverage, bank_audit, bank_item_counts(containers), ctx["show_source"])
-        write_plan(args.plan, plan, export_labels(args.sources), args.max_questions)
+        write_plan(args.plan, plan, export_labels(args.sources), args.max_questions, args.only_published)
         print(f"Action plan written to {args.plan}")
     if args.export_banks:
         wanted = banks_to_export(coverage, variants)
