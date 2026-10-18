@@ -2697,7 +2697,7 @@ def find_items(files, wanted):
     names.sort(key=lambda n: "non_cc_assessments/" not in n.lower())  # preferred copies first
     for name in names:
         data = files.read(name)
-        if not data or b"questestinterop" not in data[:2000] or not any(q.encode() in data for q in wanted):
+        if not data or b"questestinterop" not in data[:SNIFF_BYTES] or not any(q.encode() in data for q in wanted):
             continue
         try:
             root = ET.fromstring(data)
@@ -2780,7 +2780,7 @@ def manifest_files(files):  # keys use the archive's own spelling, as ExportFile
     return out
 
 
-def write_bank_export(path, wanted_banks, sources, labels):
+def write_bank_export(path, wanted_banks, sources, labels, note=""):
     """Write `path`: a Canvas course export package holding one question
     bank per quiz in `wanted_banks` (from banks_to_export()), with the
     quiz's original question XML and the pictures the questions show.
@@ -2861,6 +2861,7 @@ def write_bank_export(path, wanted_banks, sources, labels):
             finally:
                 files.close()
         manifest = ['<?xml version="1.0" encoding="UTF-8"?>',
+                    *([f"<!-- {note.replace('--', '- -')} -->"] if note else []),
                     f'<manifest identifier="{new_ident("manifest", *sorted(b for b, _ in banks))}" xmlns="{CC_NS}">',
                     "  <metadata><schema>IMS Common Cartridge</schema><schemaversion>1.1.0</schemaversion></metadata>",
                     "  <organizations/>", "  <resources>"]
@@ -2919,8 +2920,9 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
             head = f"{len(group)} quizzes that pull the same number of questions from the same banks"
         excluded = ctx.get("excluded_banks", {})
         if any((c.source_file, b) in excluded for c in group for b, _ in list(c.draws) + list(c.picks)):
-            head += (" <span class='src'>&mdash; what they take from banks left out of the comparison was not "
-                     "compared, so these may still differ there</span>")
+            head = ("Possibly the same: " + head[0].lower() + head[1:] +
+                    " <span class='src'>&mdash; what they take from banks left out of the comparison was not "
+                    "compared, so these may still differ there</span>")
         identical_html += f"""
             <div class="match-group exact"{filter_attrs("identical", (c.title for c in group))}>
               <h3>{head}</h3>
@@ -3946,8 +3948,11 @@ def main():
         skipped = sum(1 for cov in coverage if cov.quiz.engine != "classic" and (cov.missing or cov.modified))
         broken = sum(1 for cov in coverage if cov.quiz.engine == "classic"
                      for i in list(cov.missing) + list(cov.modified) if variants[i].rep.question_type == "Error")
+        note = (f"Made by quiz_dedup.py with the max-questions option at {args.max_questions}: quizzes and banks holding more "
+                f"than {args.max_questions} questions were left out, so a question here may already be in one of "
+                "those banks." if args.max_questions is not None else "")
         n_banks, n_questions, short = write_bank_export(args.export_banks, wanted, args.sources,
-                                                        export_labels(args.sources))
+                                                        export_labels(args.sources), note)
         if args.max_questions is not None:
             print(f"  ! made with --max-questions {args.max_questions}: questions also in a larger bank were "
                   "taken for questions in no bank and may already be in one", file=sys.stderr)

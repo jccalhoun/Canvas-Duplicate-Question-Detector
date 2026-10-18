@@ -62,7 +62,7 @@ python3 quiz_dedup.py fall.imscc spring.imscc -o report.html
 | `--exclude-type TYPE` | (none) | Skip a question type, such as `essay_question`. Can be repeated. |
 | `--exclude-title TEXT` | (none) | Skip quizzes and banks whose title contains `TEXT` (case-insensitive). Can be repeated. |
 | `--max-questions N` | (none) | Skip quizzes and banks holding more than `N` questions (see *Leaving out large quizzes and banks*) |
-| `--only-published` | off | In the bank orphan check, count only published quizzes as using a bank or holding a question |
+| `--only-published` | off | In the bank orphan check, count only published quizzes as using a bank or holding a question. It changes nothing else: unpublished quizzes are still compared, listed in quiz coverage and the plan, and get banks from `--export-banks` |
 
 The fixed rules behind the threshold (see *How matching works*) can also be changed, with `--loose-stem`, `--choices-floor`, `--both-margin`, `--loose-choices`, `--stem-only-min` and `--min-container`. `--help` lists their defaults. They were tuned on real exports, so change them one at a time and compare reports.
 
@@ -83,7 +83,7 @@ python3 quiz_dedup.py export.imscc -o report.html --max-questions 100
 Leaving a bank out means its questions are not looked at at all:
 
 - A small bank whose questions are also in a large bank is not shown as contained in it, and its questions can look unique. The bank check only becomes more cautious this way, never less: a copy in a left-out bank never makes another bank look safe to delete.
-- In the quiz coverage section, the action plan and `--export-banks`, a question that is only in a left-out bank counts as being in no bank. Run without `--max-questions` before putting questions into new banks, or the new banks may repeat questions the large banks already hold. When the option was used, the plan's How to use tab says so, and `--export-banks` prints a reminder.
+- In the quiz coverage section, the action plan and `--export-banks`, a question that is only in a left-out bank counts as being in no bank. Run without `--max-questions` before putting questions into new banks, or the new banks may repeat questions the large banks already hold. When the option was used, the plan's How to use tab says so, and `--export-banks` prints a reminder and writes it as a comment at the top of the package's `imsmanifest.xml`.
 
 ## Reading the report
 
@@ -265,7 +265,7 @@ Quizzes and banks that share a title carry the same `#` number as in the report.
 
 The first section of the report compares whole quizzes and question banks by the questions they hold.
 
-- **Exactly the same contents** lists quizzes and banks whose sets of questions are identical. Order does not matter, and a question repeated inside one bank counts once. Two quizzes that take questions from banks count as the same when they also draw the same number from banks holding the same questions and use the same single bank questions.
+- **Exactly the same contents** lists quizzes and banks whose sets of questions are identical. Order does not matter, and a question repeated inside one bank counts once. Two quizzes that take questions from banks count as the same when they also draw the same number from banks holding the same questions and use the same single bank questions. When some of what they take comes from a bank left out of the comparison (with `--exclude-title` or `--max-questions`), that part was not compared, and the heading starts **Possibly the same**.
 - **Mostly contained in another** lists each quiz or bank that has at least 80% (`--container-overlap`) of its questions in another one of the same size or larger. It shows how many are identical and how many are there as a modified version, and marks the ones that are fully contained. Only questions stored in the quiz or bank count here.
 - **Quizzes that use questions from banks** lists each quiz that takes questions from a bank: how many questions of its own it has, how many it draws at random from which bank, and how many single questions it uses from which bank. A New Quiz that uses every question in a bank has no number in the export and is shown as "all questions".
 - **Quizzes with nothing in the export** lists quizzes that came through with no questions and no link to a bank. Either the quiz is empty in Canvas or its content was not exported.

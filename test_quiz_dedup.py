@@ -1246,6 +1246,8 @@ class ReviewFixes(ExportCase):
         self.assertIn([["Exam", "fall.imscc"], ["Exam", "spring.imscc"]],
                       [sorted([c["title"], c["export"]] for c in g) for g in data["identical_quizzes_and_banks"]])
         self.assertIn("Hidden pool <span class='src'>(left out by --exclude-title)</span>", report)
+        # the group is reported, but not as certainly the same: part of what they take was not compared
+        self.assertIn("<h3>Possibly the same: 2 quizzes with the same contents", report)
         self.assertNotIn("a bank that is not in this export", report)
         exam = next(c for c in data["quizzes_and_banks"] if c["title"] == "Exam")
         self.assertEqual(exam["draws"][0]["bank_title"], "Hidden pool")
@@ -2062,6 +2064,21 @@ class BankExport(ExportCase):
             self.assertIn(f'href="{name}"', manifest)
         by_answer = {q.correct[0]: q.text for q in questions}
         self.assertNotEqual(by_answer[CHOICES[0]], by_answer[CHOICES[1]])  # different pictures, different stems
+
+    def test_quiz_file_with_a_long_header_is_still_exported(self):
+        xml = quiz("gq", "Long header quiz", [item(*self.Q6)]).replace(
+            "<questestinterop", "<!-- " + "x" * 5000 + " -->\n<questestinterop", 1)
+        path = self.export({"non_cc_assessments/gq.xml.qti": xml})
+        target = os.path.join(self.dir, "banks.imscc")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", os.path.join(self.dir, "r.html"),
+                                             "--export-banks", target, "--max-questions", "50"]), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            qd.main()
+        self.assertEqual([q.text for q in qd.collect_questions([target])[0]], [self.Q6[1]])
+        with zipfile.ZipFile(target) as z:
+            manifest = z.read("imsmanifest.xml").decode()
+        self.assertIn("<!-- Made by quiz_dedup.py with the max-questions option at 50:", manifest)
+        ET.fromstring(manifest)  # the comment keeps the manifest well formed
 
     def test_idents_are_stable_between_runs(self):
         _, target, _ = self.run_export()
