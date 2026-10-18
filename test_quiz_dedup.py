@@ -1531,7 +1531,7 @@ class QuizCoverageCheck(ExportCase):
         report, _ = self.run_files(files)
         # Keeper still has a question no quiz holds, so it is not called safe: no caution
         listening = self.card(report, "Listening quiz")
-        self.assertIn("Every question is in the bank <strong>Keeper</strong>, which also has 1 other question.",
+        self.assertIn("Every question is in the bank <strong>Keeper</strong>, which holds 2 questions in all.",
                       listening)
         self.assertNotIn("coverage-warn", listening)
         # Old pool's Q3 is only in the two Old final banks, which its copy makes safe to delete
@@ -1653,6 +1653,27 @@ class QuizCoverageCheck(ExportCase):
         self.assertEqual([r["ready"] for r in old_final], ["wait", "wait"])
         self.assertIn("Wait: some of its questions are otherwise only in Old pool", old_final[0]["before"])
         self.assertIn("Keep Old final", next(r for r in plan["quizzes"] if r["quiz"] == "Old pool")["keep"])
+
+    def test_a_bank_with_left_out_questions_is_not_the_same(self):
+        # Pool has Q1 and Q3 plus an essay; the quiz has Q1 and Q3. With essays left out of the comparison
+        # the bank looks like the quiz, but a question group drawing 2 from it could pick the essay
+        files = {
+            "non_cc_assessments/gp.xml.qti": bank("gp", "Pool", [item(*self.Q1), item(*self.Q3),
+                                                                 item("essay_question", "Reflect on ethos.")]),
+            "non_cc_assessments/gq.xml.qti": quiz("gq", "Short quiz", [item(*self.Q1), item(*self.Q3)]),
+        }
+        path = self.export(files)
+        out, plan_path = os.path.join(self.dir, "report.html"), os.path.join(self.dir, "plan.xlsx")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out, "--plan", plan_path,
+                                             "--exclude-type", "essay_question"]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with open(out, encoding="utf-8") as f:
+            card = self.card(f.read(), "Short quiz")
+        self.assertIn("Every question is in the bank <strong>Pool</strong>, which holds 3 questions in all.", card)
+        from openpyxl import load_workbook
+        rows = list(load_workbook(plan_path)["Quizzes"].iter_rows(values_only=True))
+        self.assertEqual(rows[1][0], 2)
 
     def test_plan_cells_are_never_formulas(self):
         files = self.course()
@@ -1869,6 +1890,41 @@ class BankExport(ExportCase):
             manifest = z.read("imsmanifest.xml").decode()
         # the picture keeps its export identity, so it maps to the course's existing file
         self.assertIn('identifier="gpic" href="web_resources/Uploaded Media/slide.png"', manifest)
+
+    def test_idents_do_not_depend_on_the_export_file_name(self):
+        course = self.course()  # built once: the same Canvas ids, exported under two file names
+
+        def bank_files(name):
+            path = self.export(course, name=name)
+            target = os.path.join(self.dir, name + ".banks.imscc")
+            with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", os.path.join(self.dir, "r.html"),
+                                                 "--export-banks", target]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                qd.main()
+            with zipfile.ZipFile(target) as z:
+                return {n: z.read(n) for n in z.namelist() if n.startswith("non_cc_assessments/")}
+        self.assertEqual(bank_files("fall-export.imscc"), bank_files("fall-export-2.imscc"))
+
+    def test_pictures_in_other_spellings_keep_the_archive_name(self):
+        stem = '<img src="%24IMS-CC-FILEBASE%24/Pics/Chart.PNG" alt="x"> <img src="../web_resources/pics/two.png"> Hm?'
+        path = self.export({"non_cc_assessments/gq.xml.qti": quiz("gq", "Charts quiz", [
+            item(MC, stem, CHOICES, [CHOICES[0]])])})
+        with zipfile.ZipFile(path, "a") as z:
+            z.writestr("web_resources/pics/chart.png", b"PIC-1")
+            z.writestr("web_resources/pics/two.png", b"PIC-2")
+            z.writestr("imsmanifest.xml", '<manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">'
+                       '<resources><resource identifier="gchart" type="webcontent" '
+                       'href="web_resources/pics/chart.png"/></resources></manifest>')
+        target = os.path.join(self.dir, "banks.imscc")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", os.path.join(self.dir, "r.html"),
+                                             "--export-banks", target]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with zipfile.ZipFile(target) as z:
+            self.assertEqual(z.read("web_resources/pics/chart.png"), b"PIC-1")
+            self.assertEqual(z.read("web_resources/pics/two.png"), b"PIC-2")
+            manifest = z.read("imsmanifest.xml").decode()
+        self.assertIn('identifier="gchart" href="web_resources/pics/chart.png"', manifest)
 
     def test_idents_are_stable_between_runs(self):
         _, target, _ = self.run_export()
