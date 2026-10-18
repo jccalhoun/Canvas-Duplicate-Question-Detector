@@ -123,8 +123,11 @@ class ImageStore:
         zf = zipfile.ZipFile(source, "r")
         # looked up without regard to case: the path in a question and the
         # path in the archive don't always agree on it
-        members = {n.lower(): n for n in zf.namelist()}
-        self.read = lambda rel: zf.read(members[rel.lower()]) if rel.lower() in members else None
+        names = set(zf.namelist())
+        members = {n.lower(): n for n in sorted(names, reverse=True)}
+        # the exact spelling wins when the archive holds two names differing only in case
+        self.read = lambda rel: (zf.read(rel) if rel in names else
+                                 zf.read(members[rel.lower()]) if rel.lower() in members else None)
         return zf
 
     def name(self, src, fallback):
@@ -623,6 +626,11 @@ def parse_quiz_xml(path, source_file):
 CONTAINER_IDENT_RE = re.compile(r"""<(?:\w+:)?(?:assessment|objectbank)\b[^>]*?\sident=["']([^"']+)["']""")
 
 
+# how much of a file is read to tell whether it is a quiz or bank file, and to find its
+# ident: the root tags come first, but a long comment or declaration can push them down
+SNIFF_BYTES = 65536
+
+
 def find_quiz_xml_files(root_dir):
     """Return list of candidate QTI file paths: quiz question files (named
     various things depending on export vintage: <hash>.xml, assessment_qti.xml)
@@ -639,7 +647,7 @@ def find_quiz_xml_files(root_dir):
             full = os.path.join(dirpath, fn)
             try:
                 with open(full, "r", encoding="utf-8", errors="ignore") as f:
-                    head = f.read(2000)
+                    head = f.read(SNIFF_BYTES)
                 if "questestinterop" in head:
                     results.append(full)
             except OSError:
@@ -659,7 +667,7 @@ def resolve_preferred_files(xml_files):
     for path in xml_files:
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
+                content = f.read(SNIFF_BYTES)  # the container tag opens the file
         except OSError:
             continue
         m = CONTAINER_IDENT_RE.search(content)
@@ -2586,7 +2594,7 @@ def new_ident(*parts):
     return "g" + hashlib.md5("\x00".join(("quiz_dedup bank export",) + parts).encode("utf-8")).hexdigest()
 
 
-def banks_to_export(coverage, variants):
+def banks_to_export(coverage, variants):  # -> [(quiz, item idents, bank title)]
     """[(quiz Container, [item ident, ...])] for each Classic quiz with
     questions that are in no bank as is: those in no bank at all and those
     in a bank only as a reworded version (the quiz's own wording is what
@@ -2594,10 +2602,13 @@ def banks_to_export(coverage, variants):
     left out: their item banks are imported a different way. So are
     questions Canvas exported as type "Error", which hold only their text."""
     out = []
-    for cov in coverage:
+    # quizzes sharing a title get the number they have in the report and the plan
+    same = Counter((cov.quiz.source_file, cov.quiz.title.lower()) for cov in coverage)
+    for n, cov in enumerate(coverage, 1):
         c = cov.quiz
         if c.engine != "classic":
             continue
+        title = c.title.strip() + (f" #{n}" if same[(c.source_file, c.title.lower())] > 1 else "")
         idents = []
         for i in list(cov.missing) + list(cov.modified):
             if variants[i].rep.question_type == "Error":
@@ -2607,7 +2618,7 @@ def banks_to_export(coverage, variants):
             if mine:
                 idents.append(min(mine, key=lambda q: q.item_id).item_id)
         if idents:
-            out.append((c, sorted(idents)))
+            out.append((c, sorted(idents), f"{title} (questions not in a bank)"))
     return out
 
 
@@ -2622,11 +2633,13 @@ class ExportFiles:
         else:
             self.names = [os.path.relpath(os.path.join(d, f), path).replace(os.sep, "/")
                           for d, _, files in os.walk(path) for f in files]
-        self.lower = {n.lower(): n for n in self.names}
+        self.exact = set(self.names)
+        self.lower = {n.lower(): n for n in sorted(self.names, reverse=True)}
 
     def canonical(self, name):
-        """The archive's own spelling of `name`, matched without regard to case, or None."""
-        return self.lower.get(name.lower())
+        """The archive's own spelling of `name`: itself when the archive has it,
+        otherwise matched without regard to case; None when it is not there."""
+        return name if name in self.exact else self.lower.get(name.lower())
 
     def read(self, name):
         name = self.canonical(name)
@@ -2715,17 +2728,18 @@ def write_bank_export(path, wanted_banks, sources, labels):
     Returns (banks written, questions written, [(quiz title, missing count)])."""
     ET.register_namespace("", QTI_NS)
     by_source = {}
-    for quiz, idents in wanted_banks:
-        by_source.setdefault(quiz.source_file, []).append((quiz, idents))
+    for quiz, idents, title in wanted_banks:
+        by_source.setdefault(quiz.source_file, []).append((quiz, idents, title))
     path_of = dict(zip(labels, sources))
     banks, short, written, resources, used_ids = [], [], 0, {}, set()
+    written_files, written_from = {}, {}
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as out:
         for label, quizzes in by_source.items():
             files = ExportFiles(path_of[label])
             try:
-                items = find_items(files, {q.cid: set(ids) for q, ids in quizzes})
+                items = find_items(files, {q.cid: set(ids) for q, ids, _ in quizzes})
                 known = manifest_files(files)
-                for quiz, idents in quizzes:
+                for quiz, idents, title in quizzes:
                     # from the quiz's Canvas id alone, which stays the same from one export of the
                     # course to the next (the export's file name does not)
                     bank_id = new_ident(quiz.cid)
@@ -2736,7 +2750,6 @@ def write_bank_export(path, wanted_banks, sources, labels):
                     root = ET.Element(f"{{{ns}}}questestinterop")
                     bank = ET.SubElement(root, f"{{{ns}}}objectbank", ident=bank_id)
                     meta = ET.SubElement(bank, f"{{{ns}}}qtimetadata")
-                    title = f"{quiz.title.strip()} (questions not in a bank)"
                     for key, value in (("bank_title", title), ("bank_state", "active")):
                         field_el = ET.SubElement(meta, f"{{{ns}}}qtimetadatafield")
                         ET.SubElement(field_el, f"{{{ns}}}fieldlabel").text = key
@@ -2759,9 +2772,17 @@ def write_bank_export(path, wanted_banks, sources, labels):
                         count += 1
                         for wanted_name in item_files(copy):
                             name = files.canonical(wanted_name)  # the spelling the manifest uses
-                            if name is None or name in resources:
+                            if name is None:
                                 continue
-                            out.writestr(name, files.read(name))
+                            data = files.read(name)
+                            if name in resources:
+                                if written_files[name] != data:
+                                    print(f"  ! two exports have different files at {name}; the bank for "
+                                          f"\"{quiz.title}\" uses the one from {written_from[name]}, so check "
+                                          "its pictures after importing", file=sys.stderr)
+                                continue
+                            written_files[name], written_from[name] = data, label
+                            out.writestr(name, data)
                             resources[name] = known.get(name) or new_ident(name)
                     if count < len(idents):
                         short.append((quiz.title, len(idents) - count))
@@ -2828,8 +2849,8 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
         else:
             head = f"{len(group)} quizzes that pull the same number of questions from the same banks"
         excluded = ctx.get("excluded_banks", {})
-        if any((c.source_file, b) in excluded for c in group for b, _ in c.draws):
-            head += (" <span class='src'>&mdash; draws from banks left out of the comparison were not "
+        if any((c.source_file, b) in excluded for c in group for b, _ in list(c.draws) + list(c.picks)):
+            head += (" <span class='src'>&mdash; what they take from banks left out of the comparison was not "
                      "compared, so these may still differ there</span>")
         identical_html += f"""
             <div class="match-group exact"{filter_attrs("identical", (c.title for c in group))}>
@@ -3650,6 +3671,11 @@ def main():
             n.lower() for n, _, _ in ADVANCED_SETTINGS if n != "MIN_CONTAINER"):
         if not 0 <= getattr(args, name) <= 100:
             ap.error(f"--{name.replace('_', '-')} must be between 0 and 100")
+    if args.compare:
+        ignored = [flag for flag, value in (("--json", args.json), ("--plan", args.plan),
+                                            ("--export-banks", args.export_banks)) if value]
+        if ignored:
+            ap.error(f"--compare writes only the comparison page; run {', '.join(ignored)} without --compare")
     if args.max_questions is not None and args.max_questions < 1:
         ap.error("--max-questions must be at least 1")
     if args.min_container < 1:

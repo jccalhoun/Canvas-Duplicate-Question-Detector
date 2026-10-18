@@ -83,7 +83,7 @@ python3 quiz_dedup.py export.imscc -o report.html --max-questions 100
 Leaving a bank out means its questions are not looked at at all:
 
 - A small bank whose questions are also in a large bank is not shown as contained in it, and its questions can look unique. The bank check only becomes more cautious this way, never less: a copy in a left-out bank never makes another bank look safe to delete.
-- In the quiz coverage section, the action plan and `--export-banks`, a question that is only in a left-out bank counts as being in no bank. Run without `--max-questions` before putting questions into new banks, or the new banks may repeat questions the large banks already hold. The plan and the bank export both carry a reminder when the option was used.
+- In the quiz coverage section, the action plan and `--export-banks`, a question that is only in a left-out bank counts as being in no bank. Run without `--max-questions` before putting questions into new banks, or the new banks may repeat questions the large banks already hold. When the option was used, the plan's How to use tab says so, and `--export-banks` prints a reminder.
 
 ## Reading the report
 
@@ -216,7 +216,7 @@ To import it:
 3. Choose **Select specific content**, then pick the banks you want under Question Banks. You can import just one to try it.
 4. The new banks appear under **Quizzes → Manage Question Banks**. Point the quiz at its bank with a question group, then delete the quiz's own copies of those questions.
 
-Each question is copied from the export's own XML, so its type, points, choices, answer key, and feedback come across as they were. Pictures in questions are packed with them, under their original file identity. The banks and questions get new ids made from the quiz's Canvas id, so they are the same on every run, even from a later export of the course saved under another file name: importing again updates the banks instead of making second copies.
+Quizzes that share a title get the same `#` number in their bank's name as in the report and the plan. If two exports passed together hold different pictures under the same path, the first one is packed and a warning names the file. Each question is copied from the export's own XML, so its type, points, choices, answer key, and feedback come across as they were. Pictures in questions are packed with them, under their original file identity. The banks and questions get new ids made from the quiz's Canvas id, so they are the same on every run, even from a later export of the course saved under another file name: importing again updates the banks instead of making second copies.
 
 Left out, with a note in the output: New Quizzes, whose item banks are imported a different way, and questions Canvas exported with the type "Error", which hold only their text. Try the import in a sandbox course first.
 
@@ -237,7 +237,7 @@ To compare any two quizzes or banks, with every list shown in full:
 python3 quiz_dedup.py export.imscc --compare "Chapter 3 Listening pool" "OLD Chapter 3 listening pool"
 ```
 
-Name each one by its title or a unique part of it. When a name matches more than one quiz or bank, the script lists them with their export ids, and you can pass an id instead. The comparison is written to `comparison.html` (change it with `--compare-output`), and no report is written in this mode. Only questions stored in each quiz or bank are compared, not ones a quiz draws from a bank.
+Name each one by its title or a unique part of it. When a name matches more than one quiz or bank, the script lists them with their export ids, and you can pass an id instead. The comparison is written to `comparison.html` (change it with `--compare-output`), and no report is written in this mode; `--json`, `--plan` and `--export-banks` are refused with it. Only questions stored in each quiz or bank are compared, not ones a quiz draws from a bank.
 
 ## Action plan
 

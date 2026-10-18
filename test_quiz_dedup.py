@@ -914,7 +914,7 @@ class ReviewFixes2(ExportCase):
                  "non_cc_assessments/q1.xml.qti": quiz("q1", "Quiz one", items, draws=[("gx", 1)]),
                  "non_cc_assessments/q2.xml.qti": quiz("q2", "Quiz two", items, draws=[("gy", 1)])}
         report, data, _ = self.main(files, "--exclude-title", "pool")
-        self.assertIn("draws from banks left out of the comparison were not compared", report)
+        self.assertIn("what they take from banks left out of the comparison was not compared", report)
         quiz_one = next(c for c in data["quizzes_and_banks"] if c["title"] == "Quiz one")
         self.assertEqual(quiz_one["draws_from_excluded_banks"], 1)
 
@@ -1022,6 +1022,12 @@ class ReviewFixes4(ExportCase):
         (q,), _, _, _ = qd.collect_questions([self.export({"non_cc_assessments/gb.xml.qti": bank("gb", "B", [xml])})])
         self.assertEqual(q.text, "Read this case. First paragraph.")
         self.assertEqual(q.choices, ["A one", "B two"])
+
+    def test_quiz_file_found_after_a_long_comment(self):
+        xml = bank("gb", "Pool", [item(MC, STEM, CHOICES, [CHOICES[0]])]).replace(
+            "<questestinterop", "<!-- " + "x" * 5000 + " -->\n<questestinterop", 1)
+        questions = qd.collect_questions([self.export({"non_cc_assessments/gb.xml.qti": xml})])[0]
+        self.assertEqual([q.text for q in questions], [STEM])
 
     def test_uppercase_extensions_are_found(self):
         os.makedirs(os.path.join(self.dir, "x"))
@@ -1948,6 +1954,62 @@ class BankExport(ExportCase):
         with zipfile.ZipFile(target) as z:
             self.assertEqual(z.read("web_resources/Pics/Map.PNG"), b"MAP")
             self.assertIn('identifier="gmap" href="web_resources/Pics/Map.PNG"', z.read("imsmanifest.xml").decode())
+
+    def test_same_titled_quizzes_get_their_report_number(self):
+        files = self.course()
+        files["non_cc_assessments/gq2.xml.qti"] = quiz("gq2", "Old quiz", [item(*self.Q6)])
+        path = self.export(files)
+        target = os.path.join(self.dir, "banks.imscc")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", os.path.join(self.dir, "r.html"),
+                                             "--export-banks", target]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        titles = sorted(c.title for c in qd.collect_questions([target])[3] if c.kind == "bank")
+        self.assertEqual(len(titles), 2)
+        for t in titles:
+            self.assertRegex(t, r"^Old quiz #\d+ \(questions not in a bank\)$")
+
+    def test_other_outputs_are_refused_in_compare_mode(self):
+        path = self.export(self.course())
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "--compare", "Bank", "Done quiz",
+                                             "--plan", os.path.join(self.dir, "p.xlsx")]), \
+                contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            qd.main()
+        self.assertIn("--compare writes only the comparison page; run --plan without --compare", err.getvalue())
+
+    def test_exact_case_wins_over_a_case_twin(self):
+        path = os.path.join(self.dir, "twins.zip")
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr("web_resources/Image.png", b"UPPER")
+            z.writestr("web_resources/image.png", b"LOWER")
+        files = qd.ExportFiles(path)
+        self.assertEqual((files.read("web_resources/image.png"), files.read("web_resources/Image.png")),
+                         (b"LOWER", b"UPPER"))
+        self.assertEqual(files.canonical("web_resources/IMAGE.PNG").lower(), "web_resources/image.png")
+        files.close()
+        store = qd.ImageStore()
+        handle = store.open(path)
+        self.assertEqual((store.read("web_resources/image.png"), store.read("web_resources/Image.png")),
+                         (b"LOWER", b"UPPER"))
+        handle.close()
+
+    def test_two_exports_with_different_pictures_at_one_path_are_flagged(self):
+        stem = '<img src="$IMS-CC-FILEBASE$/slide.png"> What is wrong here?'
+        paths = []
+        for sub, pic, other in (("fall", b"FALL", CHOICES[0]), ("spring", b"SPRING", CHOICES[1])):
+            path = self.export({"non_cc_assessments/gq.xml.qti": quiz("gq" + sub, "Slides", [
+                item(MC, stem, CHOICES, [other])])}, sub=sub, name=sub + ".imscc")
+            with zipfile.ZipFile(path, "a") as z:
+                z.writestr("web_resources/slide.png", pic)
+            paths.append(path)
+        err = io.StringIO()
+        target = os.path.join(self.dir, "banks.imscc")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", *paths, "-o", os.path.join(self.dir, "r.html"),
+                                             "--export-banks", target]), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            qd.main()
+        self.assertIn("two exports have different files at web_resources/slide.png", err.getvalue())
 
     def test_idents_are_stable_between_runs(self):
         _, target, _ = self.run_export()
