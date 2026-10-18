@@ -1926,6 +1926,29 @@ class BankExport(ExportCase):
             manifest = z.read("imsmanifest.xml").decode()
         self.assertIn('identifier="gchart" href="web_resources/pics/chart.png"', manifest)
 
+    def test_pictures_in_xml_markup_and_manifest_case_are_matched(self):
+        # an <img> written as an XML element inside the mattext, and a manifest href whose case
+        # differs from the archive member
+        import re
+        xml = re.sub(r'<mattext texttype="text/html">[^<]*PLACEHOLDER[^<]*</mattext>',
+                     '<mattext texttype="text/html">Look: <img src="$IMS-CC-FILEBASE$/Pics/Map.PNG"/></mattext>',
+                     quiz("gq", "Markup quiz", [item(MC, "PLACEHOLDER", CHOICES, [CHOICES[0]])]))
+        self.assertIn('<img src="$IMS-CC-FILEBASE$/Pics/Map.PNG"/>', xml)
+        path = self.export({"non_cc_assessments/gq.xml.qti": xml})
+        with zipfile.ZipFile(path, "a") as z:
+            z.writestr("web_resources/Pics/Map.PNG", b"MAP")
+            z.writestr("imsmanifest.xml", '<manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">'
+                       '<resources><resource identifier="gmap" type="webcontent" '
+                       'href="web_resources/pics/map.png"/></resources></manifest>')
+        target = os.path.join(self.dir, "banks.imscc")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", os.path.join(self.dir, "r.html"),
+                                             "--export-banks", target]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with zipfile.ZipFile(target) as z:
+            self.assertEqual(z.read("web_resources/Pics/Map.PNG"), b"MAP")
+            self.assertIn('identifier="gmap" href="web_resources/Pics/Map.PNG"', z.read("imsmanifest.xml").decode())
+
     def test_idents_are_stable_between_runs(self):
         _, target, _ = self.run_export()
         with zipfile.ZipFile(target) as z:
