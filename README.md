@@ -53,6 +53,7 @@ python3 quiz_dedup.py fall.imscc spring.imscc -o report.html
 | `-o`, `--output` | `quiz_duplicate_report.html` | Where to write the report |
 | `--json PATH` | (none) | Also write the findings to `PATH` as JSON |
 | `--plan PATH` | (none) | Also write an action plan to `PATH`, an `.xlsx` file (see *Action plan*) |
+| `--export-banks PATH` | (none) | Also write a package of new question banks for questions in no bank (see *Exporting questions into new banks*) |
 | `--compare A B` | (none) | Instead of the report, compare two quizzes or banks side by side (see *Comparing two quizzes or banks*) |
 | `--compare-output PATH` | `comparison.html` | Where `--compare` writes its page |
 | `-t`, `--threshold` | `85` | How similar (0 to 100) the stem or the choices must be for two questions to count as versions of each other |
@@ -60,6 +61,7 @@ python3 quiz_dedup.py fall.imscc spring.imscc -o report.html
 | `--container-overlap` | `80` | List a quiz or bank as mostly contained in another when at least this percent of its questions are also there |
 | `--exclude-type TYPE` | (none) | Skip a question type, such as `essay_question`. Can be repeated. |
 | `--exclude-title TEXT` | (none) | Skip quizzes and banks whose title contains `TEXT` (case-insensitive). Can be repeated. |
+| `--max-questions N` | (none) | Skip quizzes and banks holding more than `N` questions (see *Leaving out large quizzes and banks*) |
 | `--only-published` | off | In the bank orphan check, count only published quizzes as using a bank or holding a question |
 
 The fixed rules behind the threshold (see *How matching works*) can also be changed, with `--loose-stem`, `--choices-floor`, `--both-margin`, `--loose-choices`, `--stem-only-min` and `--min-container`. `--help` lists their defaults. They were tuned on real exports, so change them one at a time and compare reports.
@@ -68,7 +70,20 @@ Lower the threshold to catch heavier rewrites; raise it if unrelated questions a
 
 If questions about different things are being grouped, raise `--word-overlap` (try 70). If reworded questions you know about are missing, lower it (try 40). At 0 the check is off. At 100, differently worded stems only match when one is the other plus added words.
 
-Questions removed with `--exclude-type` or `--exclude-title` are dropped before anything is counted, so the totals in the report cover only what was compared. A quiz whose questions were all excluded is not listed as empty, and a bank question a quiz uses is not reported as missing because it was excluded. A bank removed with `--exclude-title` is shown by name as excluded where a quiz draws from it, and what a quiz takes from excluded banks or excluded questions is left out when quizzes are compared with each other. The report header says how many were excluded. `--help` lists the Canvas question type names.
+Questions removed with `--exclude-type` or `--exclude-title` are dropped before anything is counted, so the totals in the report cover only what was compared. A quiz whose questions were all excluded is not listed as empty, and a bank question a quiz uses is not reported as missing because it was excluded. A bank removed with `--exclude-title` or `--max-questions` is shown by name, with the option that left it out, where a quiz draws from it, and what a quiz takes from excluded banks or excluded questions is left out when quizzes are compared with each other. The report header says how many were excluded. `--help` lists the Canvas question type names.
+
+### Leaving out large quizzes and banks
+
+```
+python3 quiz_dedup.py export.imscc -o report.html --max-questions 100
+```
+
+`--max-questions N` leaves out every quiz and bank holding more than `N` questions in the export, the same way `--exclude-title` leaves out the ones it names. Use it to set aside large banks you are keeping, such as a publisher test bank, and see only whether the smaller quizzes and banks duplicate each other. The count is the questions stored in the quiz or bank, so a quiz that only draws from banks holds none and is always kept. The output lists what was left out, and the report shows the same list, folded, under its summary.
+
+Leaving a bank out means its questions are not looked at at all:
+
+- A small bank whose questions are also in a large bank is not shown as contained in it, and its questions can look unique. The bank check only becomes more cautious this way, never less: a copy in a left-out bank never makes another bank look safe to delete.
+- In the quiz coverage section, the action plan and `--export-banks`, a question that is only in a left-out bank counts as being in no bank. Run without `--max-questions` before putting questions into new banks, or the new banks may repeat questions the large banks already hold. The plan and the bank export both carry a reminder when the option was used.
 
 ## Reading the report
 
@@ -76,7 +91,7 @@ The report opens with a summary and a table of contents. Each entry links to its
 
 In the **Modified questions** section, each group is one question:
 
-- **Version A** is the version used in the most places.
+- **Version A** is the version used in the most places. A version students can get, because it is in a quiz or in a bank a quiz draws from, has an **in use** badge, so you can tell the live wording from old copies.
 - Every other version is shown as a diff against Version A, with added wording highlighted in green and removed wording in red, in both the stem and the choices.
 - A check mark shows the credited answer.
 - Badges say what changed: *Stem reworded*, *Choices changed*, *Question type differs*, or *Answer key differs*.
@@ -139,7 +154,7 @@ The first section of the report answers one question for every bank: can it be d
 - **copied only**: no quiz links to the bank, but Classic quiz questions were copied from it. The export marks each such quiz question with the bank question it came from (`assessment_question_identifierref`). The quizzes hold their own copies, so they do not need the bank.
 - **unused**: neither.
 
-Usage counts every quiz in the export, including quizzes left out of the comparison with `--exclude-title`: excluding a quiz from the comparison does not stop it using its banks. Unpublished quizzes count too, unless you pass `--only-published`.
+Usage counts every quiz in the export, including quizzes left out of the comparison with `--exclude-title` or `--max-questions`: excluding a quiz from the comparison does not stop it using its banks. Unpublished quizzes count too, unless you pass `--only-published`.
 
 **Verdict.** For a bank that is not linked, each of its questions is first sorted by where else it is found in the same export:
 
@@ -167,7 +182,7 @@ Only quizzes and linked banks count as in use. Otherwise two unused copies of on
 
 The section opens with a summary of each verdict and the banks in it. Banks with unique questions are listed by how many they hold, with numbered families such as `chapter_1-...`, `chapter_2-...` folded into one line. Each *keep as the one copy* example names the banks that rely on it. When several banks share a title, each gets a number (`#12`) used everywhere in the section, and the table also shows its first question.
 
-Each review item links to its group in *Modified questions*, where the word-level diff shows what changed.
+Each bank's questions are listed in up to three folded lists: the **reworded** ones (open when there are ten or fewer, since they are what needs a look), the ones **found nowhere else**, and the ones **kept here, also in other unused banks**. Each reworded item links to its group in *Modified questions*, where the word-level diff shows what changed. When two listed questions share a stem, the credited answer (or the choices) is added so they can be told apart. A bank with exactly the same questions as another unlinked bank says so: only one needs keeping, and reviewing one reviews them all.
 
 The statuses can be checked against the Unused Classic Quiz Bank Checker: its *Used?* column should read `LINKED`, `COPIED ONLY` or `no` for the same banks. Match banks by title and question count, since the export does not carry Canvas's bank ids.
 
@@ -180,11 +195,30 @@ The second section answers one question for every quiz that has questions of its
 - **Every question is in a bank, spread over N banks**, with how many each bank adds. The fewest banks that cover the quiz are picked, preferring a bank a quiz already links to, then the smallest.
 - How many questions are in a bank **only as a reworded version**, and how many are in **no bank**.
 
-A **Keep X** note appears when the bank check calls a bank safe to delete only because this quiz holds copies of its questions, and no other quiz does. The quiz and the bank vouch for each other, so if you change the quiz, keep the bank.
+A **Keep X** note appears when some of the quiz's questions are in no bank that will stay (a linked bank, or one kept as the one copy), and X holds them with a verdict of safe to delete or review. The bank check counts quiz copies as in use, so the quiz and the bank vouch for each other: if you change the quiz, keep the bank. When several quizzes hold the only copies, each of them gets the note.
 
 Each card can be expanded to show the reworded questions (each linked to its group in *Modified questions*, where the wording diff is), the questions in no bank, and which banks hold each question.
 
 The heading of each card gives the question count. Distinct questions are shown too when the quiz repeats a question. Quizzes that share a title are numbered (`#29`) and show their first question, as same-named banks do. A question Canvas could not export is written with the type `Error` and only its text. The report says so wherever it shows one. Quizzes that draw all their questions from banks are not listed. Questions removed with `--exclude-type` are not counted. Cards are sorted by title and work with the title filter.
+
+## Exporting questions into new banks
+
+```
+python3 quiz_dedup.py export.imscc -o report.html --plan plan.xlsx --export-banks new_banks.imscc
+```
+
+Step 4 of the action plan is putting questions into a bank. Instead of retyping them, `--export-banks` writes a file Canvas can import: one new question bank per Classic quiz, named "*quiz title* (questions not in a bank)", holding that quiz's questions that are in no bank as is. Questions found in a bank only as a reworded version go in too, in the quiz's wording. Questions already in a bank unchanged are left out, so no new duplicates are made.
+
+To import it:
+
+1. In the course, go to **Settings → Import Course Content**.
+2. Choose **Canvas Course Export Package** (not QTI .zip) and upload the file. In the content list, the banks appear under **Question Banks**; if they show up under Files instead, Canvas did not recognise the package.
+3. Choose **Select specific content**, then pick the banks you want under Question Banks. You can import just one to try it.
+4. The new banks appear under **Quizzes → Manage Question Banks**. Point the quiz at its bank with a question group, then delete the quiz's own copies of those questions.
+
+Each question is copied from the export's own XML, so its type, points, choices, answer key, and feedback come across as they were. Pictures in questions are packed with them, under their original file identity. The banks and questions get new ids, the same ones on every run, so importing the file twice updates the banks instead of making second copies.
+
+Left out, with a note in the output: New Quizzes, whose item banks are imported a different way, and questions Canvas exported with the type "Error", which hold only their text. Try the import in a sandbox course first.
 
 ## Comparing two quizzes or banks
 
@@ -219,8 +253,8 @@ The report answers "what is duplicated where". The action plan answers "what do 
   - **Step 3, spread over banks**: copy the questions into one new bank and use one question group.
   - **Step 4, put questions in a bank first**: some questions are in no bank, or only as a reworded version. A quiz whose missing questions are all essay, numerical and similar types is flagged as possibly an assignment you would rather leave alone.
 
-  The **Keep** column names banks the quiz depends on: the bank check calls them safe to delete only because this quiz has the only other copy of some of their questions.
-- **Banks**: the banks the bank check calls safe to delete, with why, and whether to go ahead. **yes** means delete it. **wait** means a quiz you have not changed yet holds the only other copy of some of its questions. **no** means the plan has a quiz draw from it, so it will be in use.
+  The **Keep** column names banks to keep until the quiz is done: some of its questions are in no bank that will stay (linked, kept as the one copy, or about to be drawn from by the plan).
+- **Banks**: the banks the bank check calls safe to delete, with why, and whether to go ahead. **yes** means delete it. **wait** means some of its questions are otherwise only in quizzes you have not finished, and in no bank that will stay; it names those quizzes. **no** means the plan has a quiz draw from it, so it will be in use.
 - **Questions**: every question from a step 4 quiz that is in no bank, or only reworded in one, with its type, choices and answer, ready to add to a bank.
 
 Quizzes and banks that share a title carry the same `#` number as in the report. Nothing is changed in Canvas: the plan is a checklist for doing the work by hand. Text from the export is written as plain text, so a question starting with `=` is never run as a formula. When several exports are compared, only quizzes in the same export count for the Keep column, as in the bank check. After a round of changes, export the course again and rerun. Finished work drops off and the plan gets shorter.

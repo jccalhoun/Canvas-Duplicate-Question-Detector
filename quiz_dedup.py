@@ -59,6 +59,9 @@ from rapidfuzz import fuzz, process
 
 TAG_RE = re.compile(r"<!--.*?-->|</?[A-Za-z][^<>]*>", re.S)  # a tag starts with a letter: "x < 3 and y > 5" is not one
 WS_RE = re.compile(r"\s+")
+# zero-width spaces, joiners and byte-order marks: Canvas's editor leaves them around pasted text.
+# They are deleted (not turned into spaces), which is what normalize() already did when matching
+ZERO_WIDTH_RE = re.compile("[\u200b\u200c\u200d\u2060\ufeff]")
 
 
 IMG_RE = re.compile(r"<img\b[^>]*>", re.I)
@@ -187,7 +190,7 @@ def strip_html(text):
     text = IMG_RE.sub(image_token, text)
     text = TAG_RE.sub(" ", text)
     text = html.unescape(text)
-    text = WS_RE.sub(" ", text).strip()
+    text = WS_RE.sub(" ", ZERO_WIDTH_RE.sub("", text)).strip()
     return text
 
 
@@ -321,7 +324,7 @@ def extract_mattext(material_el):
         raw = (child.text or "") + "".join(ET.tostring(c, encoding="unicode") for c in child)
         if (child.get("texttype") or "").lower() == "text/plain" and not len(child):
             # no tags to remove, but Canvas still writes entities such as &nbsp; in plain text
-            parts.append(WS_RE.sub(" ", html.unescape(raw)).strip())
+            parts.append(WS_RE.sub(" ", ZERO_WIDTH_RE.sub("", html.unescape(raw))).strip())
         else:
             parts.append(strip_html(raw))
     return " ".join(p for p in parts if p)
@@ -379,7 +382,7 @@ def credited_answers(item):
                 if (sv.get("action") or "").lower() == "subtract":
                     continue  # a penalty, not credit
                 try:
-                    awards = float((sv.text or "").strip()) > 0
+                    awards = awards or float((sv.text or "").strip()) > 0
                 except ValueError:
                     pass
         if awards:
@@ -1611,7 +1614,8 @@ def quiz_coverage(variants, containers, cluster_of, audit):
     """A QuizCoverage for every quiz that stores questions of its own.
     `cluster_of` maps id(variant) to its modified-question group number and
     `audit` is the bank check, whose statuses say which banks are linked.
-    A bank missing from the audit counts as not linked."""
+    A bank missing from the audit counts as not linked. Only banks in the
+    quiz's own export count: a quiz cannot draw from another course's bank."""
     linked = {(b.bank.source_file, b.bank.cid) for b in audit if b.status == USED_LINKED}
     banks_of, held, by_cluster = [], {}, {}
     for i, v in enumerate(variants):
@@ -1628,8 +1632,9 @@ def quiz_coverage(variants, containers, cluster_of, audit):
         if not idxs:
             continue
         cov = QuizCoverage(c, len(idxs))
+        local_banks = lambda i: {k for k in banks_of[i] if k[0] == c.source_file}
         for i in sorted(idxs):
-            banks = banks_of[i]
+            banks = local_banks(i)
             if banks:
                 cov.banks[i] = sorted(banks)
                 cov.linked_banks |= banks & linked
@@ -1639,7 +1644,7 @@ def quiz_coverage(variants, containers, cluster_of, audit):
                 cov.in_unlinked[i] = sorted(banks)
             else:
                 n = cluster_of.get(id(variants[i]))
-                others = set().union(*(banks_of[j] for j in by_cluster.get(n, ()) if j != i)) if n is not None else set()
+                others = set().union(*(local_banks(j) for j in by_cluster.get(n, ()) if j != i)) if n is not None else set()
                 if others:
                     cov.modified[i] = (n, sorted(others))
                 else:
@@ -2171,6 +2176,8 @@ def build_json_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                             "compared_by_web_address": ctx["images"].by_address},
         "bank_usage_audit": [bank_audit(b) for b in ctx.get("bank_audit", [])],
         "quiz_coverage": [quiz_cov(cov) for cov in ctx.get("quiz_coverage", [])],
+        "left_out_by_max_questions": [{"export": src, "kind": kind_label(kind, engine), "title": title,
+                                       "questions": n} for kind, engine, title, n, src in ctx.get("too_big", [])],
         "quizzes_and_banks": [container(c) for c in sorted(
             containers, key=lambda c: (c.kind, c.title.lower(), c.source_file, c.cid))],
         "identical_quizzes_and_banks": [[container(c) for c in group] for group in identical_containers],
@@ -2207,18 +2214,32 @@ PLAN_STEPS = {
 }
 
 
-def keep_for_quiz(cov, variants, bank_info):
-    """Banks the bank check calls safe to delete only because this quiz holds
-    the only quiz copy of some of their questions: (export, bank id) keys.
-    Deleting one of them and then changing the quiz loses those questions."""
-    here = (cov.quiz.source_file, cov.quiz.cid)
-    # only quizzes in the same export count, as in the bank check: a quiz in another
-    # course cannot stand in for this course's bank
-    sole = [i for i in cov.in_unlinked
-            if not any(q.source_kind == "quiz" and q.source_file == here[0] and (q.source_file, q.quiz_id) != here
-                       for q in variants[i].occurrences)]
-    return {k for i in sole for k in cov.in_unlinked[i]
-            if k in bank_info and bank_info[k].verdict in (VERDICT_SAFE, VERDICT_COVERED)}
+def staying_banks(audit, extra=()):
+    """(export, bank id) of the banks that will stay: linked banks, banks
+    the bank check keeps as the one copy, and `extra` (in the action plan,
+    the banks quizzes are about to draw from). A bank with unique questions
+    does not count: whether to keep it is the user's call, and deleting it
+    must not strand questions whose other copies were deleted on its account."""
+    keep = {VERDICT_COPY}
+    return {(b.bank.source_file, b.bank.cid) for b in audit
+            if b.status == USED_LINKED or b.verdict in keep} | set(extra)
+
+
+def keep_for_quiz(cov, bank_info, staying):
+    """Banks to keep while this quiz still holds its own questions: (export,
+    bank id) keys. A question the quiz holds whose banks are all unlinked
+    and none of them `staying` survives only as long as some quiz keeps a
+    copy, and the bank check counts those quiz copies as in use. So a bank
+    holding it that the check calls safe to delete (or to review) must
+    wait. Every quiz holding such a question names the bank, so two quizzes
+    sharing the only copies both get the note."""
+    at_risk = (VERDICT_SAFE, VERDICT_COVERED, VERDICT_REVIEW)
+    out = set()
+    for keys in cov.in_unlinked.values():
+        if any(k in staying for k in keys):
+            continue
+        out |= {k for k in keys if k in bank_info and bank_info[k].verdict in at_risk}
+    return out
 
 
 def build_plan(variants, coverage, audit, bank_sizes, show_source=False):
@@ -2243,10 +2264,16 @@ def build_plan(variants, coverage, audit, bank_sizes, show_source=False):
 
     def listing(items, limit=4):
         items = list(items)
-        shown = ", ".join(items[:limit])
-        return shown + (f" and {len(items) - limit} more" if len(items) > limit else "")
+        if len(items) > limit:
+            return ", ".join(items[:limit]) + f" and {len(items) - limit} more"
+        return ", ".join(items[:-1]) + " and " + items[-1] if len(items) > 1 else "".join(items)
 
     quiz_rows, question_rows, holds, uses = [], [], {}, {}
+    for cov in coverage:  # banks the plan has quizzes draw from (steps 1 and 2) will stay
+        cover = cov.cover(bank_sizes)
+        if len(cov.banks) == cov.distinct and len(cover) == 1:
+            uses.setdefault(cover[0][0], [])
+    staying = staying_banks(audit, uses)
     for n, cov in enumerate(coverage, 1):
         c = cov.quiz
         label = c.title.strip()
@@ -2292,15 +2319,15 @@ def build_plan(variants, coverage, audit, bank_sizes, show_source=False):
                                       f"Modified questions, group {group}"))
             for i in cov.missing:
                 question_rows.append((label, i, "In no bank", ""))
-        keep = sorted(keep_for_quiz(cov, variants, bank_info), key=lambda k: bank_label(k).lower())
+        keep = sorted(keep_for_quiz(cov, bank_info, staying), key=lambda k: bank_label(k).lower())
         for k in keep:
             holds.setdefault(k, []).append(label)
         quiz_rows.append({
             "step": step, "what": PLAN_STEPS[step], "quiz": label, "questions": d,
             "published": {True: "yes", False: "no"}.get(c.published, ""),
             "action": action, "banks": banks,
-            "keep": (f"Keep {listing(bank_label(k) for k in keep)}: this quiz has the only other copy of some "
-                     "of their questions." if keep else ""),
+            "keep": (f"Keep {listing(bank_label(k) for k in keep)} until this quiz is done: some of its questions "
+                     "are in no bank that will stay." if keep else ""),
         })
     quiz_rows.sort(key=lambda r: (r["step"], r["quiz"].lower()))
 
@@ -2326,8 +2353,9 @@ def build_plan(variants, coverage, audit, bank_sizes, show_source=False):
                       "the Quizzes tab). Once it does, the bank is in use and drops off this list.")
         elif waiting:
             ready = "wait"
-            before = (f"Wait: {listing(waiting)} {'has' if len(waiting) == 1 else 'have'} the only other copy "
-                      "of some of its questions. Change that quiz first, then rerun and check again.")
+            before = (f"Wait: some of its questions are otherwise only in {listing(waiting)}, and in no bank that "
+                      f"will stay. Finish {'that quiz' if len(waiting) == 1 else 'those quizzes'} first, then "
+                      "rerun and check again.")
         bank_rows.append({
             "ready": ready, "bank": bank_label(key), "questions": b.bank.item_count,
             "status": b.status, "verdict": VERDICT_LABELS[b.verdict], "why": why, "before": before,
@@ -2344,7 +2372,7 @@ def build_plan(variants, coverage, audit, bank_sizes, show_source=False):
     return {"quizzes": quiz_rows, "banks": bank_rows, "questions": questions}
 
 
-def write_plan(path, plan, sources):
+def write_plan(path, plan, sources, max_questions=None):
     """Write the action plan to an Excel file with a tab each for how to use
     it, the quizzes, the banks safe to delete, and the questions to put in a
     bank."""
@@ -2374,13 +2402,18 @@ def write_plan(path, plan, sources):
         ("2. Respect the Keep column. It names banks this quiz depends on: delete one and change the quiz, "
          "and those questions are gone.", False),
         (f"3. The Banks tab lists banks the bank check calls safe to delete. Delete only rows marked yes ({ready} "
-         "now). Wait means a quiz you have not changed yet holds the only other copy of some of its questions; "
+         "now). Wait means some of its questions are otherwise only in quizzes you have not finished; "
          "no means the plan has a quiz draw from it.", False),
         ("4. Banks not on the Banks tab hold questions found nowhere else, or need a look first. See the "
          "report's bank check.", False),
         ("5. After a round of changes, export the course again and rerun with --plan. Finished work drops off "
          "and the plan gets shorter.", False),
     ]
+    if max_questions is not None:
+        lines += [("", False),
+                  (f"Made with --max-questions {max_questions}: quizzes and banks holding more than {max_questions} "
+                   "questions were left out. A question that is also in one of those large banks shows here as "
+                   "in no bank, so check them before putting questions into a new bank.", True)]
     for text, bold in lines:
         readme.append([text])
         if bold:
@@ -2475,6 +2508,7 @@ REPORT_CSS = """
   .vhead { font-size: 0.85rem; font-weight: 600; margin-bottom: 2px; }
   .muted, .src { color: var(--muted); font-weight: 400; }
   .badge { display: inline-block; font-size: 0.72rem; font-weight: 500; border: 1px solid var(--border); border-radius: 10px; padding: 0 8px; margin-left: 6px; color: var(--muted); }
+  .badge.in-use { color: var(--key); border-color: var(--key); }
   .badge.alert { color: var(--alert); border-color: var(--alert); }
   .choices { margin: 6px 0 0; padding-left: 20px; font-size: 0.9rem; color: var(--muted); }
   .choices li.changed { color: var(--fg); }
@@ -2518,6 +2552,210 @@ REPORT_CSS = """
 """
 
 
+# ---------------------------------------------------------------------------
+# Bank export (--export-banks): questions in no bank, as a package Canvas imports
+# ---------------------------------------------------------------------------
+QTI_NS = "http://www.imsglobal.org/xsd/ims_qtiasiv1p2"
+CC_NS = "http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1"
+BANK_RESOURCE_TYPE = "associatedcontent/imscc_xmlv1p1/learning-application-resource"
+CANVAS_EXPORT_FLAG = "course_settings/canvas_export.txt"
+
+
+def new_ident(*parts):
+    """A fresh Canvas-style ident ("g" + 32 hex), stable for the same inputs,
+    so importing the same file twice updates the banks instead of doubling them."""
+    return "g" + hashlib.md5("\x00".join(("quiz_dedup bank export",) + parts).encode("utf-8")).hexdigest()
+
+
+def banks_to_export(coverage, variants):
+    """[(quiz Container, [item ident, ...])] for each Classic quiz with
+    questions that are in no bank as is: those in no bank at all and those
+    in a bank only as a reworded version (the quiz's own wording is what
+    goes in). A question the quiz repeats goes in once. New Quizzes are
+    left out: their item banks are imported a different way. So are
+    questions Canvas exported as type "Error", which hold only their text."""
+    out = []
+    for cov in coverage:
+        c = cov.quiz
+        if c.engine != "classic":
+            continue
+        idents = []
+        for i in list(cov.missing) + list(cov.modified):
+            if variants[i].rep.question_type == "Error":
+                continue
+            mine = [q for q in variants[i].occurrences
+                    if q.source_kind == "quiz" and (q.source_file, q.quiz_id) == (c.source_file, c.cid)]
+            if mine:
+                idents.append(min(mine, key=lambda q: q.item_id).item_id)
+        if idents:
+            out.append((c, sorted(idents)))
+    return out
+
+
+class ExportFiles:
+    """Read-only access to one export's files, whether it is a zip or a folder."""
+
+    def __init__(self, path):
+        self.path = path
+        self.zip = None if os.path.isdir(path) else zipfile.ZipFile(path)
+        if self.zip:
+            self.names = self.zip.namelist()
+        else:
+            self.names = [os.path.relpath(os.path.join(d, f), path).replace(os.sep, "/")
+                          for d, _, files in os.walk(path) for f in files]
+        self.lower = {n.lower(): n for n in self.names}
+
+    def read(self, name):
+        name = self.lower.get(name.lower())
+        if name is None:
+            return None
+        if self.zip:
+            return self.zip.read(name)
+        with open(os.path.join(self.path, name), "rb") as f:
+            return f.read()
+
+    def close(self):
+        if self.zip:
+            self.zip.close()
+
+
+def find_items(files, wanted):
+    """{(quiz id, item ident): <item> element} for the quiz items in
+    `wanted` (quiz id -> set of item idents), read from the export's QTI
+    files. The copy under non_cc_assessments/ is preferred: it carries
+    Canvas's own question types and settings."""
+    found = {}
+    names = [n for n in files.names if n.lower().endswith((".xml", ".qti"))
+             and os.path.basename(n).lower() not in ("imsmanifest.xml", "assessment_meta.xml")]
+    names.sort(key=lambda n: "non_cc_assessments/" not in n.lower())  # preferred copies first
+    for name in names:
+        data = files.read(name)
+        if not data or b"questestinterop" not in data[:2000] or not any(q.encode() in data for q in wanted):
+            continue
+        try:
+            root = ET.fromstring(data)
+        except ET.ParseError:
+            continue
+        for container in root.iter():
+            if local(container.tag) not in CONTAINER_TAGS or container.get("ident") not in wanted:
+                continue
+            quiz_id = container.get("ident")
+            for el in own_items(container):
+                key = (quiz_id, el.get("ident"))
+                if key[1] in wanted[quiz_id] and key not in found:
+                    found[key] = el
+    return found
+
+
+def item_files(item):
+    """Export file paths (under web_resources/) that an item's text refers to."""
+    text = "".join(item.itertext()) + "".join(v for el in item.iter() for v in el.attrib.values())
+    paths = set()
+    for base in (FILEBASE, "$IMS_CC_FILEBASE$/"):
+        for m in re.finditer(re.escape(base) + r"""([^"'<>\s?#]+)""", text):
+            paths.add("web_resources/" + urllib.parse.unquote(m.group(1)))
+    return paths
+
+
+def manifest_files(files):
+    """{file path: manifest resource identifier} for the export's files, so
+    a copied picture keeps its identity and maps to the course's existing file."""
+    data = files.read("imsmanifest.xml")
+    if not data:
+        return {}
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return {}
+    out = {}
+    for res in root.iter():
+        if local(res.tag) == "resource" and res.get("href"):
+            out[urllib.parse.unquote(res.get("href"))] = res.get("identifier")
+    return out
+
+
+def write_bank_export(path, wanted_banks, sources, labels):
+    """Write `path`: a Canvas course export package holding one question
+    bank per quiz in `wanted_banks` (from banks_to_export()), with the
+    quiz's original question XML and the pictures the questions show.
+    Returns (banks written, questions written, [(quiz title, missing count)])."""
+    ET.register_namespace("", QTI_NS)
+    by_source = {}
+    for quiz, idents in wanted_banks:
+        by_source.setdefault(quiz.source_file, []).append((quiz, idents))
+    path_of = dict(zip(labels, sources))
+    banks, short, written, resources = [], [], 0, {}
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as out:
+        for label, quizzes in by_source.items():
+            files = ExportFiles(path_of[label])
+            try:
+                items = find_items(files, {q.cid: set(ids) for q, ids in quizzes})
+                known = manifest_files(files)
+                for quiz, idents in quizzes:
+                    bank_id = new_ident(label, quiz.cid)
+                    ns = QTI_NS
+                    root = ET.Element(f"{{{ns}}}questestinterop")
+                    bank = ET.SubElement(root, f"{{{ns}}}objectbank", ident=bank_id)
+                    meta = ET.SubElement(bank, f"{{{ns}}}qtimetadata")
+                    title = f"{quiz.title.strip()} (questions not in a bank)"
+                    for key, value in (("bank_title", title), ("bank_state", "active")):
+                        field_el = ET.SubElement(meta, f"{{{ns}}}qtimetadatafield")
+                        ET.SubElement(field_el, f"{{{ns}}}fieldlabel").text = key
+                        ET.SubElement(field_el, f"{{{ns}}}fieldentry").text = value
+                    count = 0
+                    for ident in idents:
+                        el = items.get((quiz.cid, ident))
+                        if el is None:
+                            continue
+                        copy = ET.fromstring(ET.tostring(el))
+                        copy.set("ident", new_ident(label, quiz.cid, ident))
+                        # the link back to the bank question it came from would point at nothing
+                        for meta_el in list(copy.iter()):
+                            for f in list(meta_el):
+                                if local(f.tag) == "qtimetadatafield" and any(
+                                        local(x.tag) == "fieldlabel" and (x.text or "").strip() ==
+                                        "assessment_question_identifierref" for x in f):
+                                    meta_el.remove(f)
+                        bank.append(copy)
+                        count += 1
+                        for name in item_files(copy):
+                            data = files.read(name)
+                            if data is not None and name not in resources:
+                                out.writestr(name, data)
+                                resources[name] = known.get(name) or new_ident(label, name)
+                    if count < len(idents):
+                        short.append((quiz.title, len(idents) - count))
+                    if count:
+                        href = f"non_cc_assessments/{bank_id}.xml.qti"
+                        out.writestr(href, b'<?xml version="1.0" encoding="UTF-8"?>\n'
+                                     + ET.tostring(root, encoding="utf-8").split(b"?>", 1)[-1].lstrip())
+                        banks.append((bank_id, href))
+                        written += count
+            finally:
+                files.close()
+        manifest = ['<?xml version="1.0" encoding="UTF-8"?>',
+                    f'<manifest identifier="{new_ident("manifest", *sorted(b for b, _ in banks))}" xmlns="{CC_NS}">',
+                    "  <metadata><schema>IMS Common Cartridge</schema><schemaversion>1.1.0</schemaversion></metadata>",
+                    "  <organizations/>", "  <resources>"]
+        for bank_id, href in banks:
+            manifest.append(f'    <resource identifier="{bank_id}" type="{BANK_RESOURCE_TYPE}" href="{esc(href)}">'
+                            f'<file href="{esc(href)}"/></resource>')
+        for name, ident in sorted(resources.items()):
+            manifest.append(f'    <resource type="webcontent" identifier="{esc(ident)}" href="{esc(name)}">'
+                            f'<file href="{esc(name)}"/></resource>')
+        # Canvas only treats the file as its own course export package (and so reads the
+        # banks under non_cc_assessments/) when the manifest lists this flag file as a resource.
+        # Without it the package is taken for a plain Common Cartridge and the banks for files.
+        manifest.append(f'    <resource identifier="{new_ident("canvas_export", *sorted(b for b, _ in banks))}" '
+                        f'type="{BANK_RESOURCE_TYPE}" href="{CANVAS_EXPORT_FLAG}">'
+                        f'<file href="{CANVAS_EXPORT_FLAG}"/></resource>')
+        manifest += ["  </resources>", "</manifest>", ""]
+        out.writestr("imsmanifest.xml", "\n".join(manifest))
+        # Canvas recognises its own course export package by this file
+        out.writestr(CANVAS_EXPORT_FLAG, "Made by quiz_dedup.py --export-banks.\n")
+    return len(banks), written, short
+
+
 def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, same_choice_groups, repeated,
                       identical_containers, container_overlaps, unresolved, threshold,
                       total_questions, total_quizzes, total_banks, ctx):
@@ -2551,7 +2789,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
             head = f"{len(group)} quizzes that pull the same number of questions from the same banks"
         excluded = ctx.get("excluded_banks", {})
         if any((c.source_file, b) in excluded for c in group for b, _ in c.draws):
-            head += (" <span class='src'>&mdash; draws from banks excluded by --exclude-title were not "
+            head += (" <span class='src'>&mdash; draws from banks left out of the comparison were not "
                      "compared, so these may still differ there</span>")
         identical_html += f"""
             <div class="match-group exact"{filter_attrs("identical", (c.title for c in group))}>
@@ -2574,7 +2812,8 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
             bank = banks.get((c.source_file, bank_id))
             if bank is None and (c.source_file, bank_id) in ctx.get("excluded_banks", {}):
                 title = ctx["excluded_banks"][(c.source_file, bank_id)]
-                return f"{esc(title)} <span class='src'>(excluded by --exclude-title)</span>"
+                why = ctx.get("excluded_why", {}).get((c.source_file, bank_id), "--exclude-title")
+                return f"{esc(title)} <span class='src'>(left out by {why})</span>"
             if bank is None:
                 return f"a bank that is not in this export <span class='src'>({esc(bank_id)})</span>"
             return (f"[{esc(kind_label('bank', bank.engine))}] {esc(bank.title)} "
@@ -2647,19 +2886,28 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
     overlap_html = (overlap_html + no_match("mostly-contained")) if overlap_html else \
         "<p class='empty'>None found at this setting.</p>"
 
+    linked_banks = {(b.bank.source_file, b.bank.cid) for b in ctx.get("bank_audit", []) if b.status == USED_LINKED}
+
+    def in_use_badge(v):
+        """A badge on a version that students can get: it is in a quiz, or in a bank a quiz links to."""
+        if any(q.source_kind == "quiz" or (q.source_file, q.quiz_id) in linked_banks for q in v.occurrences):
+            return " <span class='badge in-use' title='in a quiz, or in a bank a quiz draws from'>in use</span>"
+        return ""
+
     def render_clusters(groups, empty, section, anchor=None):
         rendered = []
         for number, cluster in enumerate(groups, 1):
             ref = cluster[0]
             lead = len(ref.occurrences) > max(len(v.occurrences) for v in cluster[1:])
             cards = [render_variant(ref, ctx, heading="Version A" + (
-                " <span class='muted'>(most used)</span>" if lead else ""))]
+                " <span class='muted'>(most used)</span>" if lead else ""), badges=in_use_badge(ref))]
             any_key = False
             for n, v in enumerate(cluster[1:], 1):
                 badges, keyed = describe_change(ref, v)
                 any_key = any_key or keyed
                 letter = chr(ord("A") + n) if n < 26 else f"#{n + 1}"
-                cards.append(render_variant(v, ctx, heading=f"Version {letter} ", ref=ref, badges=badges))
+                cards.append(render_variant(v, ctx, heading=f"Version {letter} ", ref=ref,
+                                            badges=in_use_badge(v) + badges))
             total = sum(len(v.occurrences) for v in cluster)
             ident = f' id="{anchor}-{number}"' if anchor else ""
             rendered.append((any_key, total, f"""
@@ -2811,6 +3059,35 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
         parts = ([f"{same} as is"] if same else []) + ([f"{modified} modified"] if modified else [])
         return f"{same + modified} of {held} <span class='src'>({', '.join(parts)})</span>"
 
+    twins = {}
+    for b in audit:
+        if b.verdict and b.bank.members:
+            twins.setdefault(frozenset(b.bank.members), []).append(b)
+
+    def twin_note(b):
+        others = [o for o in twins.get(frozenset(b.bank.members), ()) if o is not b] if b.bank.members else []
+        if not others:
+            return ""
+        return (f"<p class='src'>Exactly the same questions as {bank_links(others)}. Only one of them needs "
+                "keeping, and reviewing one reviews them all.</p>")
+
+    def question_labels(idxs):
+        """Escaped stem for each variant index, with the credited answer (or,
+        failing that, the choices) added where two listed questions share a stem."""
+        stems = Counter(variants[i].rep.text for i in idxs)
+        answers = Counter((variants[i].rep.text, tuple(variants[i].rep.correct)) for i in idxs)
+        out = {}
+        for i in idxs:
+            q = variants[i].rep
+            text = esc(short(q.text))
+            if stems[q.text] > 1:
+                if q.correct and answers[(q.text, tuple(q.correct))] == 1:
+                    text += f" <span class='src'>(answer: {esc(short('; '.join(q.correct), 60))})</span>"
+                elif q.choices:
+                    text += f" <span class='src'>(choices: {esc(short(' | '.join(q.choices), 90))})</span>"
+            out[i] = text
+        return out
+
     # same-named banks are the hard case, so those rows also show their first question and a number
     for n, b in enumerate(audit, 1):
         c = b.bank
@@ -2836,26 +3113,33 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                 counts.append(f"{b.count(coverage)} {label}")
         if b.not_compared:
             counts.append(f"{b.not_compared} not compared (excluded by --exclude-type)")
-        lines = ""
-        for f in b.findings:
-            if f.coverage in ("exact", "kept_copy"):
-                continue
-            stem = esc(short(variants[f.variant].rep.text))
+        shown = [f for f in b.findings if f.coverage not in ("exact", "kept_copy")]
+        label = question_labels([f.variant for f in shown])
+        lists = {"reworded": [], "unique": [], "unused_only": []}
+        for f in shown:
             group = ctx["cluster_of"].get(id(variants[f.variant]))
             link = f" &middot; <a href='#modified-{group}'>group {group}</a>" if group else ""
             if f.coverage == "modified":
-                where = f"a modified version is in use in {names(f.places)}{link}"
+                where, kind = f"a modified version is in use in {names(f.places)}{link}", "reworded"
             elif f.coverage == "kept_version":
-                where = f"a modified version is in a bank to keep: {names(f.places)}{link}"
+                where, kind = f"a modified version is in a bank to keep: {names(f.places)}{link}", "reworded"
             elif f.coverage == "unused_only":
-                where = f"kept here; also in unused banks: {names(f.places)}"
+                where, kind = f"also in unused banks: {names(f.places)}", "unused_only"
             else:
-                where = "found nowhere else in the export"
-            lines += f"<li>{stem} <span class='src'>&mdash; {where}</span></li>"
+                where, kind = "", "unique"
+            lists[kind].append(f"<li>{label[f.variant]}" + (f" <span class='src'>&mdash; {where}</span>" if where else "")
+                               + "</li>")
         in_use = {t for f in b.findings if f.coverage == "exact" for t in f.places}
         detail = ""
-        if lines:
-            detail += f"<details open><summary>Questions to look at</summary><ul class='containers'>{lines}</ul></details>"
+        for kind, summary in (("reworded", "reworded: compare before deleting"),
+                              ("unique", "found nowhere else in the export"),
+                              ("unused_only", "kept here, also in other unused banks")):
+            items = lists[kind]
+            if items:
+                # the reworded ones are what needs a look; open them when the list is short
+                opened = " open" if kind == "reworded" and len(items) <= 10 else ""
+                detail += (f"<details{opened}><summary>{plural(len(items), 'question')} {summary}</summary>"
+                           f"<ul class='containers'>{''.join(items)}</ul></details>")
         if in_use:
             detail += (f"<details><summary>Where the exact copies are in use</summary>"
                        f"<p class='src'>{names(in_use)}</p></details>")
@@ -2872,7 +3156,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                 {plural(c.size, 'distinct question')} &middot; {esc(b.status)}
                 <span class='verdict {b.verdict}'>{VERDICT_LABELS[b.verdict]}</span></h3>
               <p class='src'>{'; '.join(counts) or 'No questions in the export.'}</p>
-              {copied}{detail}
+              {twin_note(b)}{copied}{detail}
             </div>
             """)
     # ---- written summary of the verdicts
@@ -3018,6 +3302,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
         return one if n == 1 else many
 
     coverage_cards = ""
+    staying = staying_banks(audit)
     quiz_title_count = Counter((cov.quiz.source_file, cov.quiz.title.lower()) for cov in coverage)
     for n, cov in enumerate(coverage, 1):
         c = cov.quiz
@@ -3068,12 +3353,12 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                          f"{plural(len(cov.missing), 'question')} {are(len(cov.missing))} in no bank.")
 
         # ---- a bank the bank check calls safe to delete only because this quiz has copies of its questions
-        safe = sorted(keep_for_quiz(cov, variants, bank_info), key=lambda k: bank_titles.get(k, "").lower())
+        safe = sorted(keep_for_quiz(cov, bank_info, staying), key=lambda k: bank_titles.get(k, "").lower())
         caution = ""
         if safe:
-            caution = (f"<p class='coverage-warn'>Keep {name_list(safe)} if you change this quiz. The bank check "
-                       f"calls {are(len(safe), 'it', 'them')} safe to delete because this quiz has copies of "
-                       f"{are(len(safe), 'its', 'their')} questions.</p>")
+            caution = (f"<p class='coverage-warn'>Keep {name_list(safe)} if you change this quiz. Some of its "
+                       "questions are in no bank that will stay, and the bank check counts this quiz's copies of "
+                       f"them as in use when it judges {are(len(safe), 'that bank', 'those banks')}.</p>")
 
         # ---- the per-question detail, folded away
         detail = ""
@@ -3117,6 +3402,17 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
   {coverage_cards}
   {no_match("quiz-coverage")}
 """
+
+    too_big_html = ""
+    if ctx.get("too_big"):
+        rows = "".join(f"<li>[{esc(kind_label(kind, engine))}] <strong>{esc(title)}</strong> "
+                       f"<span class='src'>({plural(n, 'question')}){' ' + esc(src) if ctx['show_source'] else ''}"
+                       f"</span></li>" for kind, engine, title, n, src in ctx["too_big"])
+        too_big_html = (f"<details class='summary'><summary>{plural(len(ctx['too_big']), 'quiz or bank', 'quizzes and banks')} "
+                        f"with more than {ctx['max_questions']} questions left out (--max-questions)</summary>"
+                        f"<ul class='containers'>{rows}</ul><p>Their questions were not compared, so a question "
+                        "that is also in one of them counts here as being in no bank, and a quiz drawing from one "
+                        "of them still counts as using it.</p></details>")
 
     bank_summary = ""
     if audit:
@@ -3177,6 +3473,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
     {len(repeated)} questions with a repeated choice.
     Threshold {threshold:g}, word overlap {ctx["min_overlap"]:g}. Generated {date.today().isoformat()}.{ctx.get("excluded_note", "")}{ctx.get("image_note", "")}
   </p>
+  {too_big_html}
 
   <div class="filter-bar" role="search">
     <div class="filter-row">
@@ -3263,6 +3560,10 @@ def main():
                          "title (or part of one) or by export id, to --compare-output.")
     ap.add_argument("--compare-output", metavar="PATH", default="comparison.html",
                     help="Where --compare writes its page (default comparison.html).")
+    ap.add_argument("--export-banks", metavar="PATH",
+                    help="Also write PATH (an .imscc file) holding, for each Classic quiz with questions in no bank, "
+                         "a question bank of those questions, to import into Canvas as a Canvas Course Export "
+                         "Package.")
     ap.add_argument("--plan", metavar="PATH",
                     help="Also write an action plan to PATH (an .xlsx file): what to do with each quiz to get its "
                          "questions into banks, which banks are safe to delete, and which questions are in no bank. "
@@ -3293,6 +3594,10 @@ def main():
                          "read from assessment_meta.xml).")
     ap.add_argument("--exclude-title", action="append", default=[], metavar="TEXT",
                     help="Skip quizzes and banks whose title contains TEXT (case-insensitive). Repeatable.")
+    ap.add_argument("--max-questions", type=int, metavar="N",
+                    help="Skip quizzes and banks holding more than N questions in the export, as --exclude-title "
+                         "does, to look only at the smaller ones. A quiz that only draws from banks holds none, "
+                         "so it is kept.")
     tuning = ap.add_argument_group(
         "advanced matching settings",
         "The fixed rules behind --threshold. The defaults were tuned on real course exports; "
@@ -3305,12 +3610,15 @@ def main():
             n.lower() for n, _, _ in ADVANCED_SETTINGS if n != "MIN_CONTAINER"):
         if not 0 <= getattr(args, name) <= 100:
             ap.error(f"--{name.replace('_', '-')} must be between 0 and 100")
+    if args.max_questions is not None and args.max_questions < 1:
+        ap.error("--max-questions must be at least 1")
     if args.min_container < 1:
         ap.error("--min-container must be at least 1")
     # no output may overwrite an input export or another output
     same_file = lambda path: os.path.normcase(os.path.realpath(path))
     outputs = ([("--compare-output", args.compare_output)] if args.compare else
-               [("--output", args.output), ("--json", args.json), ("--plan", args.plan)])
+               [("--output", args.output), ("--json", args.json), ("--plan", args.plan),
+                ("--export-banks", args.export_banks)])
     outputs = [(flag, path) for flag, path in outputs if path]
     inputs = {same_file(p) for p in args.sources}
     seen = {}
@@ -3346,23 +3654,40 @@ def main():
                       f"{images.by_address} by web address.")
         print(f" {image_note}")
     excluded_note = ""
-    excluded_banks = {}
-    if args.exclude_type or args.exclude_title:
+    excluded_banks, excluded_why = {}, {}
+    too_big_list = []
+    titles = [t.lower() for t in args.exclude_title]
+    # quizzes and banks left out by title or by size, as (export, kind, id)
+    too_big = ({(c.source_file, c.kind, c.cid) for c in containers if c.item_count > args.max_questions}
+               if args.max_questions is not None else set())
+    left_out = lambda c: (c.source_file, c.kind, c.cid) in too_big or any(t in c.title.lower() for t in titles)
+    if args.exclude_type or titles or too_big:
         types = {t.lower() for t in args.exclude_type}
-        titles = [t.lower() for t in args.exclude_title]
+        dropped = {(c.source_file, c.kind, c.cid) for c in containers if left_out(c)}
         kept = [q for q in questions
                 if q.question_type.lower() not in types
+                and (q.source_file, q.source_kind, q.quiz_id) not in dropped
                 and not any(t in q.quiz_title.lower() for t in titles)]
         excluded_note = f" {len(questions) - len(kept)} questions excluded by filters."
+        if too_big:
+            excluded_note += (f" Left out for holding more than {args.max_questions} questions "
+                              f"(--max-questions): {plural(len(too_big), 'quiz or bank', 'quizzes and banks')}.")
+            too_big_list = sorted(((c.kind, c.engine, c.title, c.item_count, c.source_file) for c in containers
+                                   if (c.source_file, c.kind, c.cid) in too_big), key=lambda r: (-r[3], r[2].lower()))
         print(f" {excluded_note.strip()}")
+        for kind, engine, title, n, _ in too_big_list:
+            print(f"    [{kind_label(kind, engine)}] {title} ({n})")
         questions = kept
-        if titles:
-            hidden = lambda title: any(t in title.lower() for t in titles)
-            excluded_banks = {(c.source_file, c.cid): c.title for c in containers
-                              if c.kind == "bank" and hidden(c.title)}
-            containers = [c for c in containers if not hidden(c.title)]
-            bank_usage = {k: {t for t in v if not hidden(t)} for k, v in bank_usage.items()}
-            unresolved = [u for u in unresolved if not hidden(u[1])]
+        if dropped:
+            excluded_banks = {(c.source_file, c.cid): c.title for c in containers if c.kind == "bank" and left_out(c)}
+            excluded_why = {(c.source_file, c.cid): "--max-questions" if (c.source_file, c.kind, c.cid) in too_big
+                            else "--exclude-title" for c in containers if c.kind == "bank" and left_out(c)}
+            # a title is hidden where it names only quizzes and banks that were left out
+            shown = {(c.source_file, c.title) for c in containers if not left_out(c)}
+            gone = {(c.source_file, c.title) for c in containers if left_out(c)} - shown
+            containers = [c for c in containers if not left_out(c)]
+            bank_usage = {k: {t for t in v if (k[0], t) not in gone} for k, v in bank_usage.items()}
+            unresolved = [u for u in unresolved if (u[0], u[1]) not in gone]
     kept_items = Counter((q.source_file, q.quiz_id) for q in questions if q.source_kind == "bank")
     excluded_items = {key: n - kept_items.get(key, 0) for key, n in bank_items.items() if n > kept_items.get(key, 0)}
     quizzes = [c for c in containers if c.kind == "quiz"]
@@ -3439,9 +3764,11 @@ def main():
 
     ctx = {"show_source": len({q.source_file for q in questions}) > 1, "bank_usage": bank_usage,
            "excluded_note": excluded_note, "min_overlap": args.word_overlap,
+           "too_big": too_big_list, "max_questions": args.max_questions,
            "container_overlap": args.container_overlap, "containers": containers,
            "engine_note": engine_note, "draw_note": draw_note, "picked_by": picked_by,
            "images": images, "image_note": image_note, "excluded_banks": excluded_banks,
+           "excluded_why": excluded_why,
            "variants": variants, "bank_audit": bank_audit, "refs_seen": refs_seen,
            "refs_resolved": refs_resolved, "cluster_of": cluster_of, "only_published": args.only_published,
            "classic_quiz_items": classic_quiz_items, "quiz_coverage": coverage}
@@ -3466,6 +3793,7 @@ def main():
                     "threshold": args.threshold,
                     "word_overlap": args.word_overlap, "container_overlap": args.container_overlap,
                     "exclude_type": list(args.exclude_type), "exclude_title": list(args.exclude_title),
+                    "max_questions": args.max_questions,
                     "only_published": args.only_published,
                     **{n.lower(): getattr(args, n.lower()) for n, _, _ in ADVANCED_SETTINGS}}
         data = build_json_report(clusters, lookalikes, exact_variants, unrelated_groups, same_choice_groups,
@@ -3477,8 +3805,29 @@ def main():
         sizes = {key: held for key, (held, _, _) in bank_spread(variants, [b.bank for b in bank_audit],
                                                                  cluster_of).items()}
         plan = build_plan(variants, coverage, bank_audit, sizes, ctx["show_source"])
-        write_plan(args.plan, plan, export_labels(args.sources))
+        write_plan(args.plan, plan, export_labels(args.sources), args.max_questions)
         print(f"Action plan written to {args.plan}")
+    if args.export_banks:
+        wanted = banks_to_export(coverage, variants)
+        skipped = sum(1 for cov in coverage if cov.quiz.engine != "classic" and (cov.missing or cov.modified))
+        broken = sum(1 for cov in coverage if cov.quiz.engine == "classic"
+                     for i in list(cov.missing) + list(cov.modified) if variants[i].rep.question_type == "Error")
+        n_banks, n_questions, short = write_bank_export(args.export_banks, wanted, args.sources,
+                                                        export_labels(args.sources))
+        if args.max_questions is not None:
+            print(f"  ! made with --max-questions {args.max_questions}: questions also in a larger bank were "
+                  "taken for questions in no bank and may already be in one", file=sys.stderr)
+        print(f"Bank export written to {args.export_banks}: {plural(n_banks, 'bank')}, "
+              f"{plural(n_questions, 'question')}")
+        for title, n in short:
+            print(f"  ! {plural(n, 'question')} of \"{title}\" could not be found in the export files and "
+                  "were left out", file=sys.stderr)
+        if skipped:
+            print(f"  {plural(skipped, 'New Quiz', 'New Quizzes')} with questions in no bank left out: "
+                  "New Quizzes item banks are imported a different way")
+        if broken:
+            print(f"  {plural(broken, 'question')} Canvas could not export (type Error) left out: "
+                  "recreate them by hand")
 
 
 if __name__ == "__main__":

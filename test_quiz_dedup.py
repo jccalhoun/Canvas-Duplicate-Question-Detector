@@ -914,7 +914,7 @@ class ReviewFixes2(ExportCase):
                  "non_cc_assessments/q1.xml.qti": quiz("q1", "Quiz one", items, draws=[("gx", 1)]),
                  "non_cc_assessments/q2.xml.qti": quiz("q2", "Quiz two", items, draws=[("gy", 1)])}
         report, data, _ = self.main(files, "--exclude-title", "pool")
-        self.assertIn("draws from banks excluded by --exclude-title were not compared", report)
+        self.assertIn("draws from banks left out of the comparison were not compared", report)
         quiz_one = next(c for c in data["quizzes_and_banks"] if c["title"] == "Quiz one")
         self.assertEqual(quiz_one["draws_from_excluded_banks"], 1)
 
@@ -1239,7 +1239,7 @@ class ReviewFixes(ExportCase):
             report = f.read()
         self.assertIn([["Exam", "fall.imscc"], ["Exam", "spring.imscc"]],
                       [sorted([c["title"], c["export"]] for c in g) for g in data["identical_quizzes_and_banks"]])
-        self.assertIn("Hidden pool <span class='src'>(excluded by --exclude-title)</span>", report)
+        self.assertIn("Hidden pool <span class='src'>(left out by --exclude-title)</span>", report)
         self.assertNotIn("a bank that is not in this export", report)
         exam = next(c for c in data["quizzes_and_banks"] if c["title"] == "Exam")
         self.assertEqual(exam["draws"][0]["bank_title"], "Hidden pool")
@@ -1537,8 +1537,8 @@ class QuizCoverageCheck(ExportCase):
         # Old pool's Q3 is only in the two Old final banks, which its copy makes safe to delete
         old_pool = self.card(report, "Old pool")
         self.assertRegex(old_pool, r"<p class='coverage-warn'>Keep <strong>Old final</strong>.* and "
-                                   r"<strong>Old final</strong>.* if you change this quiz\. The bank check calls them "
-                                   r"safe to delete because this quiz has copies of their questions\.</p>")
+                                   r"<strong>Old final</strong>.* if you change this quiz\. Some of its questions are "
+                                   r"in no bank that will stay")
 
     def test_no_caution_when_another_quiz_also_has_a_copy(self):
         # the Fallacies quiz copy of Q5 is only in Extra; with a second quiz holding the same copy,
@@ -1549,6 +1549,28 @@ class QuizCoverageCheck(ExportCase):
         card = self.card(report, "Fallacies quiz 2")
         self.assertIn("Every question is in the bank <strong>Extra</strong>", card)
         self.assertNotIn("coverage-warn", card)
+
+    def test_two_quizzes_sharing_the_only_copies_both_hold_the_bank(self):
+        # Q3 is only in the two unlinked Old final banks, and in two quizzes. Each bank is "safe"
+        # because the quizzes hold copies; finishing both quizzes would lose Q3, so both must say Keep
+        # and the banks must wait for both
+        files = self.course()
+        files["non_cc_assessments/gq4.xml.qti"] = quiz("gq4", "Second pool", [item(*self.Q3), item(*self.Q6)])
+        path = self.export(files)
+        out, plan_path = os.path.join(self.dir, "report.html"), os.path.join(self.dir, "plan.xlsx")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out, "--plan", plan_path]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with open(out, encoding="utf-8") as f:
+            report = f.read()
+        for title in ("Old pool", "Second pool"):
+            self.assertIn("coverage-warn'>Keep <strong>Old final</strong>", self.card(report, title))
+        from openpyxl import load_workbook
+        rows = list(load_workbook(plan_path)["Banks"].iter_rows(values_only=True))
+        head = rows[0]
+        old_final = [dict(zip(head, r)) for r in rows[1:] if r[head.index("Bank")].startswith("Old final")]
+        self.assertEqual([r["Ready to delete"] for r in old_final], ["wait", "wait"])
+        self.assertIn("Old pool and Second pool", old_final[0]["Before deleting"])
 
     def test_same_named_quizzes_are_numbered(self):
         files = self.course()
@@ -1629,7 +1651,7 @@ class QuizCoverageCheck(ExportCase):
         plan = qd.build_plan(variants, coverage, audit, sizes)
         old_final = [r for r in plan["banks"] if r["bank"].startswith("Old final")]
         self.assertEqual([r["ready"] for r in old_final], ["wait", "wait"])
-        self.assertIn("Wait: Old pool has the only other copy", old_final[0]["before"])
+        self.assertIn("Wait: some of its questions are otherwise only in Old pool", old_final[0]["before"])
         self.assertIn("Keep Old final", next(r for r in plan["quizzes"] if r["quiz"] == "Old pool")["keep"])
 
     def test_plan_cells_are_never_formulas(self):
@@ -1768,6 +1790,152 @@ class Comparison(ExportCase):
         page = os.path.join(self.dir, "cmp.html")
         self.run_main("--compare", "gx", "gy", "--compare-output", page)
         self.assertTrue(os.path.exists(page))
+
+
+class BankExport(ExportCase):
+    """--export-banks: a Canvas course export package with one bank per
+    Classic quiz, holding the quiz's questions that are in no bank as is."""
+    Q1, Q3, Q5 = OrphanBanks.Q1, OrphanBanks.Q3, OrphanBanks.Q5
+    Q5_REWORDED, Q6 = QuizCoverageCheck.Q5_REWORDED, QuizCoverageCheck.Q6
+
+    def course(self):
+        broken = item(MC, "Drag the steps into order", CHOICES, [CHOICES[0]]).replace(
+            "<fieldentry>multiple_choice_question</fieldentry>", "<fieldentry>Error</fieldentry>")
+        return {
+            "non_cc_assessments/gb.xml.qti": bank("gb", "Bank", [item(*self.Q1), item(*self.Q5)]),
+            "non_cc_assessments/gq.xml.qti": quiz("gq", "Old quiz", [
+                item(*self.Q1), item(*self.Q3), item(*self.Q3), item(*self.Q5_REWORDED), item(*self.Q6), broken],
+                bank_refs=[]),
+            "non_cc_assessments/gn.xml.qti": quiz("gn", "New one", [item(*self.Q6, new=True)], new=True),
+            "non_cc_assessments/gd.xml.qti": quiz("gd", "Done quiz", [item(*self.Q1)]),
+        }
+
+    def run_export(self):
+        path = self.export(self.course())
+        out, target = os.path.join(self.dir, "report.html"), os.path.join(self.dir, "banks.imscc")
+        printed = io.StringIO()
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out, "--export-banks", target]), \
+                contextlib.redirect_stdout(printed):
+            qd.main()
+        return path, target, printed.getvalue()
+
+    def test_package_holds_the_questions_not_in_a_bank(self):
+        path, target, printed = self.run_export()
+        self.assertIn("Bank export written to", printed)
+        self.assertIn("1 bank, 3 questions", printed)
+        self.assertIn("1 New Quiz with questions in no bank left out", printed)
+        self.assertIn("1 question Canvas could not export (type Error) left out", printed)
+        with zipfile.ZipFile(target) as z:
+            names = z.namelist()
+            self.assertIn("imsmanifest.xml", names)
+            self.assertIn("course_settings/canvas_export.txt", names)
+            manifest = z.read("imsmanifest.xml").decode()
+            (bank_file,) = [n for n in names if n.startswith("non_cc_assessments/")]
+            self.assertIn(f'href="{bank_file}"', manifest)
+            # how Canvas recognises its own export package (lib/canvas/migration/package_identifier.rb):
+            # a manifest resource whose href is the flag file, under the Common Cartridge schema
+            doc = ET.fromstring(manifest)
+            ns = {"m": qd.CC_NS}
+            self.assertEqual(doc.findtext("m:metadata/m:schema", namespaces=ns), "IMS Common Cartridge")
+            self.assertIsNotNone(doc.find("m:resources/m:resource[@href='course_settings/canvas_export.txt']", ns))
+            xml = z.read(bank_file).decode()
+        self.assertIn("<fieldentry>Old quiz (questions not in a bank)</fieldentry>", xml)
+        self.assertNotIn("assessment_question_identifierref", xml)
+        # read back by the script itself: Q3 once, Q6, and the quiz's reworded Q5; Q1 is already in a bank
+        questions, _, _, containers = qd.collect_questions([target])
+        self.assertEqual([c.title for c in containers if c.kind == "bank"], ["Old quiz (questions not in a bank)"])
+        self.assertEqual(sorted(q.text for q in questions), sorted([self.Q3[1], self.Q5_REWORDED[1], self.Q6[1]]))
+        self.assertEqual({q.source_kind for q in questions}, {"bank"})
+        q6 = next(q for q in questions if q.text == self.Q6[1])
+        self.assertEqual((q6.choices, q6.correct, q6.question_type), (self.Q6[2], self.Q6[3], MC))
+        originals = {q.item_id for q in qd.collect_questions([path])[0]}
+        self.assertFalse({q.item_id for q in questions} & originals)  # fresh idents
+
+    def test_pictures_go_with_their_questions(self):
+        stem = '<img src="$IMS-CC-FILEBASE$/Uploaded%20Media/slide.png?canvas_download=1" alt="x"> What is wrong here?'
+        path = self.export({"non_cc_assessments/gq.xml.qti": quiz("gq", "Slides quiz", [
+            item(MC, stem, CHOICES, [CHOICES[0]])])})
+        with zipfile.ZipFile(path, "a") as z:
+            z.writestr("web_resources/Uploaded Media/slide.png", b"PNGDATA")
+            z.writestr("imsmanifest.xml", '<manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">'
+                       '<resources><resource identifier="gpic" type="webcontent" '
+                       'href="web_resources/Uploaded Media/slide.png"/></resources></manifest>')
+        out, target = os.path.join(self.dir, "report.html"), os.path.join(self.dir, "banks.imscc")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out, "--export-banks", target]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with zipfile.ZipFile(target) as z:
+            self.assertEqual(z.read("web_resources/Uploaded Media/slide.png"), b"PNGDATA")
+            manifest = z.read("imsmanifest.xml").decode()
+        # the picture keeps its export identity, so it maps to the course's existing file
+        self.assertIn('identifier="gpic" href="web_resources/Uploaded Media/slide.png"', manifest)
+
+    def test_idents_are_stable_between_runs(self):
+        _, target, _ = self.run_export()
+        with zipfile.ZipFile(target) as z:
+            first = sorted(z.namelist())
+        _, target, _ = self.run_export()
+        with zipfile.ZipFile(target) as z:
+            self.assertEqual(sorted(z.namelist()), first)
+
+
+class MaxQuestions(ExportCase):
+    """--max-questions N leaves out quizzes and banks holding more than N
+    questions, so the smaller ones can be compared on their own."""
+    QS = [OrphanBanks.Q1, OrphanBanks.Q2, OrphanBanks.Q3, OrphanBanks.Q4, OrphanBanks.Q5]
+
+    def course(self):
+        q1, q2, q3 = self.QS[:3]
+        return {
+            "non_cc_assessments/gbig.xml.qti": bank("gbig", "Publisher bank", [item(*q) for q in self.QS]),
+            "non_cc_assessments/gqbig.xml.qti": quiz("gqbig", "Big final", [item(*q) for q in self.QS[:4]]),
+            "non_cc_assessments/ga.xml.qti": bank("ga", "Small A", [item(*q1), item(*q2), item(*q3)]),
+            "non_cc_assessments/gb.xml.qti": bank("gb", "Small B", [item(*q1), item(*q2), item(*q3)]),
+            "non_cc_assessments/gq.xml.qti": quiz("gq", "Unit quiz", [], bank_refs=["ga", "gbig"]),
+        }
+
+    def run_main(self, *extra):
+        path = self.export(self.course())
+        out, target = os.path.join(self.dir, "report.html"), os.path.join(self.dir, "report.json")
+        printed = io.StringIO()
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out, "--json", target, *extra]), \
+                contextlib.redirect_stdout(printed):
+            qd.main()
+        with open(out, encoding="utf-8") as f, open(target, encoding="utf-8") as g:
+            return f.read(), json.load(g), printed.getvalue()
+
+    def test_large_quizzes_and_banks_are_left_out(self):
+        report, data, printed = self.run_main("--max-questions", "3")
+        titles = {c["title"] for c in data["quizzes_and_banks"]}
+        self.assertEqual(titles, {"Small A", "Small B", "Unit quiz"})  # the draw-only quiz holds none, so stays
+        self.assertEqual(data["summary"]["questions"], 6)
+        self.assertEqual(data["settings"]["max_questions"], 3)
+        self.assertEqual([(c["title"], c["questions"]) for c in data["left_out_by_max_questions"]],
+                         [("Publisher bank", 5), ("Big final", 4)])
+        self.assertIn("Left out for holding more than 3 questions (--max-questions): 2 quizzes and banks.", printed)
+        self.assertIn("[bank] Publisher bank (5)", printed)
+        # the two small banks are still found to be the same
+        (group,) = data["identical_quizzes_and_banks"]
+        self.assertEqual(sorted(c["title"] for c in group), ["Small A", "Small B"])
+        # the report names what was left out, and the quiz still draws from the large bank
+        self.assertIn("2 quizzes and banks with more than 3 questions left out (--max-questions)", report)
+        self.assertIn("<strong>Publisher bank</strong> <span class='src'>(5 questions)", report)
+        self.assertIn("Publisher bank <span class='src'>(left out by --max-questions)</span>", report)
+        # Small A is linked; usage was worked out before anything was left out
+        self.assertEqual({b["title"]: b["status"] for b in data["bank_usage_audit"]},
+                         {"Small A": "linked", "Small B": "unused"})
+
+    def test_without_the_option_nothing_is_left_out(self):
+        report, data, _ = self.run_main()
+        self.assertEqual(len(data["quizzes_and_banks"]), 5)
+        self.assertEqual(data["left_out_by_max_questions"], [])
+        self.assertNotIn("--max-questions)</summary>", report)
+
+    def test_limit_must_be_positive(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            self.run_main("--max-questions", "0")
+        self.assertIn("--max-questions must be at least 1", err.getvalue())
 
 
 class Scoring(unittest.TestCase):
