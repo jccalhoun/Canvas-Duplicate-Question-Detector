@@ -62,7 +62,7 @@ python3 quiz_dedup.py fall.imscc spring.imscc -o report.html
 | `--exclude-type TYPE` | (none) | Skip a question type, such as `essay_question`. Can be repeated. |
 | `--exclude-title TEXT` | (none) | Skip quizzes and banks whose title contains `TEXT` (case-insensitive). Can be repeated. |
 | `--max-questions N` | (none) | Skip quizzes and banks holding more than `N` questions (see *Leaving out large quizzes and banks*) |
-| `--only-published` | off | In the bank orphan check, count only published quizzes as using a bank or holding a question |
+| `--only-published` | off | In the bank orphan check, count only published quizzes as using a bank or holding a question. It changes nothing else: unpublished quizzes are still compared, listed in quiz coverage and the plan, and get banks from `--export-banks` |
 
 The fixed rules behind the threshold (see *How matching works*) can also be changed, with `--loose-stem`, `--choices-floor`, `--both-margin`, `--loose-choices`, `--stem-only-min` and `--min-container`. `--help` lists their defaults. They were tuned on real exports, so change them one at a time and compare reports.
 
@@ -83,7 +83,7 @@ python3 quiz_dedup.py export.imscc -o report.html --max-questions 100
 Leaving a bank out means its questions are not looked at at all:
 
 - A small bank whose questions are also in a large bank is not shown as contained in it, and its questions can look unique. The bank check only becomes more cautious this way, never less: a copy in a left-out bank never makes another bank look safe to delete.
-- In the quiz coverage section, the action plan and `--export-banks`, a question that is only in a left-out bank counts as being in no bank. Run without `--max-questions` before putting questions into new banks, or the new banks may repeat questions the large banks already hold. The plan and the bank export both carry a reminder when the option was used.
+- In the quiz coverage section, the action plan and `--export-banks`, a question that is only in a left-out bank counts as being in no bank. Run without `--max-questions` before putting questions into new banks, or the new banks may repeat questions the large banks already hold. When the option was used, the plan's How to use tab says so, and `--export-banks` prints a reminder and writes it as a comment at the top of the package's `imsmanifest.xml`.
 
 ## Reading the report
 
@@ -133,6 +133,7 @@ The JSON file holds the same findings as the HTML report, in the same order, for
 | --- | --- |
 | `generated`, `settings`, `summary`, `question_images` | Run date, the options used, overall counts, and how question images were compared |
 | `bank_usage_audit`, `classic_bank_links` | Each bank's usage status, orphan verdict, how many of its questions are also stored elsewhere (`also_stored_elsewhere`), the kept banks it relies on or is kept for, and how many quiz questions point back to a bank question |
+| `duplicates_inside` | Each quiz or bank that stores a question more than once (with the number of copies) or in more than one version (with the modified-question group) |
 | `quiz_coverage` | For each quiz with questions of its own: the bank with the same questions (if any), the fewest banks covering it (`covered_by`), counts of questions in a linked bank, only in banks no quiz links to, only reworded in a bank, or in no bank, and the questions in the last three groups |
 | `quizzes_and_banks` | Every quiz and bank, with what each quiz draws or uses from banks |
 | `identical_quizzes_and_banks`, `mostly_contained`, `quizzes_with_nothing_in_export` | The whole-quiz and whole-bank findings |
@@ -216,7 +217,7 @@ To import it:
 3. Choose **Select specific content**, then pick the banks you want under Question Banks. You can import just one to try it.
 4. The new banks appear under **Quizzes → Manage Question Banks**. Point the quiz at its bank with a question group, then delete the quiz's own copies of those questions.
 
-Each question is copied from the export's own XML, so its type, points, choices, answer key, and feedback come across as they were. Pictures in questions are packed with them, under their original file identity. The banks and questions get new ids made from the quiz's Canvas id, so they are the same on every run, even from a later export of the course saved under another file name: importing again updates the banks instead of making second copies.
+Quizzes that share a title get the same `#` number in their bank's name as in the report and the plan. If two exports passed together hold different pictures under the same path, the second is packed in a folder of its own and its question is pointed at it, so each bank shows its own picture. Each question is copied from the export's own XML, so its type, points, choices, answer key, and feedback come across as they were. Pictures in questions are packed with them, under their original file identity. The banks and questions get new ids made from the quiz's Canvas id, so they are the same on every run, even from a later export of the course saved under another file name: importing again updates the banks instead of making second copies.
 
 Left out, with a note in the output: New Quizzes, whose item banks are imported a different way, and questions Canvas exported with the type "Error", which hold only their text. Try the import in a sandbox course first.
 
@@ -237,7 +238,7 @@ To compare any two quizzes or banks, with every list shown in full:
 python3 quiz_dedup.py export.imscc --compare "Chapter 3 Listening pool" "OLD Chapter 3 listening pool"
 ```
 
-Name each one by its title or a unique part of it. When a name matches more than one quiz or bank, the script lists them with their export ids, and you can pass an id instead. The comparison is written to `comparison.html` (change it with `--compare-output`), and no report is written in this mode. Only questions stored in each quiz or bank are compared, not ones a quiz draws from a bank.
+Name each one by its title or a unique part of it. When a name matches more than one quiz or bank, the script lists them with their export ids, and you can pass an id instead. The comparison is written to `comparison.html` (change it with `--compare-output`), and no report is written in this mode; `--json`, `--plan` and `--export-banks` are refused with it. Only questions stored in each quiz or bank are compared, not ones a quiz draws from a bank.
 
 ## Action plan
 
@@ -253,17 +254,29 @@ The report answers "what is duplicated where". The action plan answers "what do 
   - **Step 3, spread over banks**: copy the questions into one new bank and use one question group.
   - **Step 4, put questions in a bank first**: some questions are in no bank, or only as a reworded version. A quiz whose missing questions are all essay, numerical and similar types is flagged as possibly an assignment you would rather leave alone.
 
+  A step 1 to 3 row starts with **Check first** when deleting the quiz's questions would touch more than the report compared: questions left out with `--exclude-type` (keep those), or a question the quiz holds more than once (a question group then gives fewer questions). The report's quiz card says the same.
+
   The **Keep** column names banks to keep until the quiz is done: some of its questions are in no bank that will stay (linked, kept as the one copy, or about to be drawn from by the plan).
 - **Banks**: the banks the bank check calls safe to delete, with why, and whether to go ahead. **yes** means delete it. **wait** means some of its questions are otherwise only in quizzes you have not finished, and in no bank that will stay; it names those quizzes. **no** means the plan has a quiz draw from it, so it will be in use.
+- **Repeats** (only when there are any): one row per question a quiz or bank stores more than once or in more than one version, as an optional cleanup list. See *Duplicates inside one quiz or bank*.
 - **Questions**: every question from a step 4 quiz that is in no bank, or only reworded in one, with its type, choices and answer, ready to add to a bank.
 
 Quizzes and banks that share a title carry the same `#` number as in the report. Nothing is changed in Canvas: the plan is a checklist for doing the work by hand. Text from the export is written as plain text, so a question starting with `=` is never run as a formula. When several exports are compared, only quizzes in the same export count for the Keep column, as in the bank check. After a round of changes, export the course again and rerun. Finished work drops off and the plan gets shorter.
+
+## Duplicates inside one quiz or bank
+
+This section lists every quiz and bank that stores a question more than once, or stores one question in more than one version. Copies spread across different quizzes and banks are covered elsewhere; this is only about what one quiz or bank holds on its own.
+
+- **Stored more than once.** Each repeated question is listed with how many copies there are (`×3`). An extra copy in a bank makes a question group more likely to draw it; an extra copy in a quiz asks it twice.
+- **Stored in more than one version.** Each pair is shown side by side, the other version's wording marked against the first, with a link to its group in *Modified questions*. Two versions in one bank mean a student can get the same question twice, worded differently.
+
+Only questions stored in the quiz or bank count, not ones a quiz draws from a bank. Cards are sorted by how much there is to fix and work with the title filter. The JSON has the same list as `duplicates_inside`, and the action plan has it as an optional **Repeats** tab, one row per thing to fix.
 
 ## Duplicate quizzes and banks
 
 The first section of the report compares whole quizzes and question banks by the questions they hold.
 
-- **Exactly the same contents** lists quizzes and banks whose sets of questions are identical. Order does not matter, and a question repeated inside one bank counts once. Two quizzes that take questions from banks count as the same when they also draw the same number from banks holding the same questions and use the same single bank questions.
+- **Exactly the same contents** lists quizzes and banks whose sets of questions are identical. Order does not matter, and a question repeated inside one bank counts once. Two quizzes that take questions from banks count as the same when they also draw the same number from banks holding the same questions and use the same single bank questions. When some of what they take comes from a bank left out of the comparison (with `--exclude-title` or `--max-questions`), that part was not compared, and the heading starts **Possibly the same**.
 - **Mostly contained in another** lists each quiz or bank that has at least 80% (`--container-overlap`) of its questions in another one of the same size or larger. It shows how many are identical and how many are there as a modified version, and marks the ones that are fully contained. Only questions stored in the quiz or bank count here.
 - **Quizzes that use questions from banks** lists each quiz that takes questions from a bank: how many questions of its own it has, how many it draws at random from which bank, and how many single questions it uses from which bank. A New Quiz that uses every question in a bank has no number in the export and is shown as "all questions".
 - **Quizzes with nothing in the export** lists quizzes that came through with no questions and no link to a bank. Either the quiz is empty in Canvas or its content was not exported.
