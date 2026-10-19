@@ -1963,6 +1963,45 @@ def describe_change(ref, v):
     return html_tags, keyed
 
 
+@dataclass
+class InsideDuplicates:
+    """Duplicates found inside one quiz or bank."""
+    container: Container
+    repeats: list = field(default_factory=list)   # [(variant index, copies)] for a question held 2+ times
+    versions: list = field(default_factory=list)  # [(modified group number, [variant index, ...])], 2+ versions
+
+    @property
+    def extra_copies(self):
+        return sum(n - 1 for _, n in self.repeats)
+
+
+def find_inside_duplicates(variants, containers, cluster_of):
+    """For every quiz and bank: the questions it stores more than once, as
+    is, and the questions it stores in more than one version (two or more
+    variants from one modified-question group). Only stored questions count,
+    not ones a quiz draws from a bank. Sorted by how much there is to fix."""
+    found = {(c.source_file, c.kind, c.cid): c for c in containers}
+    out = {}
+    for i, v in enumerate(variants):
+        copies = Counter((q.source_file, q.source_kind, q.quiz_id) for q in v.occurrences)
+        for key, n in copies.items():
+            if n > 1 and key in found:
+                out.setdefault(key, InsideDuplicates(found[key])).repeats.append((i, n))
+    groups = {}
+    for i, v in enumerate(variants):
+        g = cluster_of.get(id(v))
+        if g is None:
+            continue
+        for key in {(q.source_file, q.source_kind, q.quiz_id) for q in v.occurrences}:
+            groups.setdefault((key, g), []).append(i)
+    for (key, g), idxs in sorted(groups.items(), key=lambda kv: kv[0][1]):
+        if len(idxs) > 1 and key in found:
+            out.setdefault(key, InsideDuplicates(found[key])).versions.append((g, idxs))
+    for d in out.values():
+        d.repeats.sort(key=lambda r: (-r[1], variants[r[0]].rep.text.lower()))
+    return sorted(out.values(), key=lambda d: (-(d.extra_copies + len(d.versions)), d.container.title.lower()))
+
+
 # in the report, a side-by-side list longer than this is counted instead of shown
 COMPARE_LIMIT = 25
 
@@ -2222,6 +2261,13 @@ def build_json_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
                             "compared_by_web_address": ctx["images"].by_address},
         "bank_usage_audit": [bank_audit(b) for b in ctx.get("bank_audit", [])],
         "quiz_coverage": [quiz_cov(cov) for cov in ctx.get("quiz_coverage", [])],
+        "duplicates_inside": [dict(ref(d.container), questions=d.container.item_count,
+                                   stored_more_than_once=[{"stem": ctx["variants"][i].rep.text, "copies": n}
+                                                          for i, n in d.repeats],
+                                   in_more_than_one_version=[{"modified_group": g,
+                                                              "stems": [ctx["variants"][i].rep.text for i in idxs]}
+                                                             for g, idxs in d.versions])
+                              for d in ctx.get("inside", [])],
         "left_out_by_max_questions": [{"export": src, "kind": kind_label(kind, engine), "title": title,
                                        "questions": n} for kind, engine, title, n, src in ctx.get("too_big", [])],
         "quizzes_and_banks": [container(c) for c in sorted(
@@ -2288,7 +2334,7 @@ def keep_for_quiz(cov, bank_info, staying):
     return out
 
 
-def build_plan(variants, coverage, audit, bank_sizes, show_source=False):
+def build_plan(variants, coverage, audit, bank_sizes, show_source=False, inside=()):
     """The action plan as plain data: {"quizzes": [...], "banks": [...],
     "questions": [...]}, each a list of row dicts in the order to work
     through them. `coverage` is quiz_coverage()'s list in report order, so
@@ -2420,7 +2466,26 @@ def build_plan(variants, coverage, audit, bank_sizes, show_source=False):
             "quiz": label, "type": type_label(q.question_type), "status": status, "question": q.text,
             "choices": " | ".join(q.choices), "answer": " | ".join(q.correct), "report": where,
         })
-    return {"quizzes": quiz_rows, "banks": bank_rows, "questions": questions}
+    repeats = []
+    names = Counter((d.container.source_file, d.container.kind, d.container.title.lower()) for d in inside)
+    for d in inside:
+        c = d.container
+        label = c.title.strip()
+        if names[(c.source_file, c.kind, c.title.lower())] > 1:
+            label += f" [{c.cid}]"
+        if show_source:
+            label += f" [{c.source_file}]"
+        kind = kind_label(c.kind, c.engine)
+        for i, n in d.repeats:
+            repeats.append({"where": label, "kind": kind, "what": f"Stored {n} times: delete {n - 1}",
+                            "question": variants[i].rep.text, "other": "", "report": ""})
+        for g, idxs in d.versions:
+            repeats.append({"where": label, "kind": kind,
+                            "what": f"{len(idxs)} versions: keep one wording",
+                            "question": variants[idxs[0]].rep.text,
+                            "other": "\n".join(variants[j].rep.text for j in idxs[1:]),
+                            "report": f"Modified questions, group {g}"})
+    return {"quizzes": quiz_rows, "banks": bank_rows, "questions": questions, "repeats": repeats}
 
 
 def write_plan(path, plan, sources, max_questions=None, only_published=False):
@@ -2460,6 +2525,8 @@ def write_plan(path, plan, sources, max_questions=None, only_published=False):
          "report's bank check.", False),
         ("5. After a round of changes, export the course again and rerun with --plan. Finished work drops off "
          "and the plan gets shorter.", False),
+        (f"Optional: the Repeats tab lists questions a quiz or bank holds more than once, or in more than one "
+         f"version ({len(plan.get('repeats', []))} rows). Clean these up in Canvas whenever it suits you.", False),
     ]
     if only_published:
         lines += [("", False),
@@ -2510,6 +2577,10 @@ def write_plan(path, plan, sources, max_questions=None, only_published=False):
     sheet("Questions", [("Quiz", "quiz", 30), ("Type", "type", 22), ("Where it is", "status", 30),
                         ("Question", "question", 60), ("Choices", "choices", 45), ("Answer", "answer", 30),
                         ("In the report", "report", 20), ("Done", None, 8)], plan["questions"])
+    if plan.get("repeats"):
+        sheet("Repeats", [("Quiz or bank", "where", 34), ("Kind", "kind", 10), ("What", "what", 24),
+                          ("Question", "question", 60), ("Other versions", "other", 60),
+                          ("In the report", "report", 22), ("Done", None, 8)], plan["repeats"])
     wb.save(path)
 
 
@@ -2604,6 +2675,7 @@ REPORT_CSS = """
   .compare-sum { font-size: 0.9rem; margin: 4px 0 8px; }
   details.compare { margin: 4px 0 8px; }
   details.compare > summary { font-size: 0.85rem; }
+  .inside-pair { margin: 8px 0 12px; }
   .same-list { font-size: 0.85rem; color: var(--muted); margin: 4px 0 0; padding-left: 20px; }
   @media (max-width: 640px) { .compare-grid { grid-template-columns: 1fr; } .compare-grid > .col-head { display: none; } }
 """
@@ -3123,6 +3195,46 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
     def names(titles):
         return esc(", ".join(sorted(titles, key=str.lower)))
 
+    inside_html = ""
+    for d in ctx.get("inside", []):
+        c = d.container
+        parts = []
+        if d.repeats:
+            parts.append(f"{plural(len(d.repeats), 'question')} stored more than once "
+                         f"({plural(d.extra_copies, 'extra copy', 'extra copies')})")
+        if d.versions:
+            parts.append(f"{plural(len(d.versions), 'question')} stored in more than one version")
+        body = ""
+        if d.repeats:
+            items = "".join(f"<li>{esc(short(variants[i].rep.text))} <span class='src'>&times;{n}</span></li>"
+                            for i, n in d.repeats)
+            body += (f"<details{' open' if len(d.repeats) <= 10 else ''}><summary>Stored more than once: "
+                     f"delete the extra copies</summary><ul class='containers'>{items}</ul></details>")
+        if d.versions:
+            cells = ""
+            for g, idxs in d.versions:
+                ref = variants[idxs[0]]
+                pair = "".join(render_variant(variants[j], ctx, heading="Other version ", ref=ref,
+                                              badges=describe_change(ref, variants[j])[0], locations=False)
+                               for j in idxs[1:])
+                cells += (f"<div class='inside-pair'><p class='src'>Group {g} &middot; "
+                          f"<a href='#modified-{g}'>all its versions</a></p><div class='compare-grid'>"
+                          f"{render_variant(ref, ctx, heading='One version', locations=False)}"
+                          f"<div>{pair}</div></div></div>")
+            body += (f"<details{' open' if len(d.versions) <= 5 else ''}><summary>Stored in more than one version: "
+                     f"keep one wording</summary>{cells}</details>")
+        inside_html += f"""
+            <div class="match-group near"{filter_attrs("inside", [c.title])}>
+              <h3>[{esc(kind_label(c.kind, c.engine))}] <strong>{esc(c.title)}</strong>{source(c)} &middot;
+                {plural(c.item_count, 'question')}</h3>
+              <p class='src'>{'; '.join(parts)}.</p>
+              {body}
+            </div>
+            """
+    inside_html = (inside_html + no_match("inside")) if inside_html else \
+        "<p class='empty'>No quiz or bank holds a question twice or in two versions.</p>"
+
+
     # quiz titles whose every quiz of that name is unpublished
     quiz_states = {}
     for c in ctx["containers"]:
@@ -3574,6 +3686,7 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
     if coverage:
         toc += toc_item("quiz-coverage", "Quiz coverage", len(coverage))
     toc += toc_item("quizzes-and-banks", "Duplicate quizzes and banks", "", f"<ul>{sub}</ul>")
+    toc += toc_item("inside", "Duplicates inside one quiz or bank", len(ctx.get("inside", [])))
     toc += toc_item("modified", "Modified questions", len(clusters))
     toc += toc_item("similar-wording", "Similar wording, different answer", len(lookalikes))
     toc += toc_item("exact", "Exact duplicates", len(exact_variants))
@@ -3639,6 +3752,13 @@ def build_html_report(clusters, lookalikes, exact_variants, unrelated_groups, sa
   Only questions stored in the quiz or bank count here, not ones a quiz uses from a bank.</p>
   {overlap_html}
 {built_html}
+  <h2 id="inside">Duplicates inside one quiz or bank <a class="top" href="#contents">Contents &uarr;</a></h2>
+  <p>Questions a single quiz or bank stores more than once, and questions it stores in more than one
+  version. An extra copy in a bank makes a question group more likely to draw that question; an extra copy in a
+  quiz asks it twice. Two versions in one bank mean students can get the same question twice in different
+  words. Only questions stored in the quiz or bank count, not ones a quiz draws from a bank.</p>
+  {inside_html}
+
   <h2 id="modified">Modified questions <a class="top" href="#contents">Contents &uarr;</a></h2>
   <p>Each group is one question that exists in more than one version. Version A is the
   most-used version, or the first one found when there is a tie; every other version is shown as a diff against it:
@@ -3899,6 +4019,11 @@ def main():
     gaps = sum(1 for cov in coverage if cov.modified or cov.missing)
     print(f"  Quiz coverage: {len(coverage) - gaps} of {plural(len(coverage), 'quiz', 'quizzes')} "
           "have every question in a bank unchanged")
+    inside = find_inside_duplicates(variants, containers, cluster_of)
+    if inside:
+        print(f"  Duplicates inside one quiz or bank: {plural(len(inside), 'quiz or bank', 'quizzes and banks')}, "
+              f"{plural(sum(d.extra_copies for d in inside), 'extra copy', 'extra copies')} and "
+              f"{plural(sum(len(d.versions) for d in inside), 'question')} in more than one version")
 
     ctx = {"show_source": len(args.sources) > 1, "bank_usage": bank_usage,
            "excluded_note": excluded_note, "min_overlap": args.word_overlap,
@@ -3909,7 +4034,7 @@ def main():
            "excluded_why": excluded_why,
            "variants": variants, "bank_audit": bank_audit, "refs_seen": refs_seen,
            "refs_resolved": refs_resolved, "cluster_of": cluster_of, "only_published": args.only_published,
-           "classic_quiz_items": classic_quiz_items, "quiz_coverage": coverage}
+           "classic_quiz_items": classic_quiz_items, "quiz_coverage": coverage, "inside": inside}
     if args.compare:
         a, b = (find_container(text, containers) for text in args.compare)
         if a is b:
@@ -3940,7 +4065,7 @@ def main():
             json.dump(data, f, indent=2, ensure_ascii=False)
         print(f"JSON written to {args.json}")
     if args.plan:
-        plan = build_plan(variants, coverage, bank_audit, bank_item_counts(containers), ctx["show_source"])
+        plan = build_plan(variants, coverage, bank_audit, bank_item_counts(containers), ctx["show_source"], inside)
         write_plan(args.plan, plan, export_labels(args.sources), args.max_questions, args.only_published)
         print(f"Action plan written to {args.plan}")
     if args.export_banks:

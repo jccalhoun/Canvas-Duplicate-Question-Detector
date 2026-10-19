@@ -1587,7 +1587,8 @@ class QuizCoverageCheck(ExportCase):
         files = self.course()
         files["non_cc_assessments/gq7.xml.qti"] = quiz("gq7", "Old pool", [item(*self.Q6)])
         report, _ = self.run_files(files)
-        heads = [h for h in report.split("<strong>Old pool</strong>")[1:]]
+        section = report[report.index('id="quiz-coverage"'):report.index('id="quizzes-and-banks"')]
+        heads = [h for h in section.split("<strong>Old pool</strong>")[1:]]
         self.assertEqual(len(heads), 2)
         for h in heads:
             self.assertTrue(h.startswith(" <span class='src'>#"), h[:60])
@@ -1622,7 +1623,7 @@ class QuizCoverageCheck(ExportCase):
             qd.main()
         from openpyxl import load_workbook
         wb = load_workbook(plan_path)
-        self.assertEqual(wb.sheetnames, ["How to use", "Quizzes", "Banks", "Questions"])
+        self.assertEqual(wb.sheetnames, ["How to use", "Quizzes", "Banks", "Questions", "Repeats"])
         rows = lambda name: [dict(zip(next(wb[name].iter_rows(values_only=True)), r))
                              for r in list(wb[name].iter_rows(values_only=True))[1:]]
         quizzes = {r["Quiz"]: r for r in rows("Quizzes")}
@@ -2146,6 +2147,70 @@ class MaxQuestions(ExportCase):
         with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
             self.run_main("--max-questions", "0")
         self.assertIn("--max-questions must be at least 1", err.getvalue())
+
+
+class InsideDuplicates(ExportCase):
+    """Questions one quiz or bank stores more than once, or in more than one version."""
+    Q1, Q2, Q2_TWEAKED, Q3 = OrphanBanks.Q1, OrphanBanks.Q2, OrphanBanks.Q2_TWEAKED, OrphanBanks.Q3
+
+    def course(self):
+        return {
+            # Q1 three times, Q2 in two versions, Q3 once
+            "non_cc_assessments/gb.xml.qti": bank("gb", "Messy bank", [
+                item(*self.Q1), item(*self.Q1), item(*self.Q1), item(*self.Q2), item(*self.Q2_TWEAKED),
+                item(*self.Q3)]),
+            # Q1 and Q3 once each: clean, though the questions are also in Messy bank
+            "non_cc_assessments/gc.xml.qti": bank("gc", "Clean bank", [item(*self.Q1), item(*self.Q3)]),
+            "non_cc_assessments/gq.xml.qti": quiz("gq", "Twice quiz", [item(*self.Q3), item(*self.Q3)]),
+        }
+
+    def run_main(self, *extra):
+        path = self.export(self.course())
+        out, target = os.path.join(self.dir, "report.html"), os.path.join(self.dir, "report.json")
+        plan = os.path.join(self.dir, "plan.xlsx")
+        printed = io.StringIO()
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out, "--json", target,
+                                             "--plan", plan, *extra]), contextlib.redirect_stdout(printed):
+            qd.main()
+        with open(out, encoding="utf-8") as f, open(target, encoding="utf-8") as g:
+            return f.read(), json.load(g), plan, printed.getvalue()
+
+    def test_repeats_and_versions_inside_one_container(self):
+        report, data, plan, printed = self.run_main()
+        inside = {d["title"]: d for d in data["duplicates_inside"]}
+        self.assertEqual(set(inside), {"Messy bank", "Twice quiz"})  # copies across banks do not count
+        messy = inside["Messy bank"]
+        self.assertEqual([(r["stem"], r["copies"]) for r in messy["stored_more_than_once"]], [(self.Q1[1], 3)])
+        (versions,) = messy["in_more_than_one_version"]
+        self.assertEqual(versions["stems"], [self.Q2[1], self.Q2_TWEAKED[1]])
+        self.assertIsInstance(versions["modified_group"], int)
+        self.assertEqual([(r["stem"], r["copies"]) for r in inside["Twice quiz"]["stored_more_than_once"]],
+                         [(self.Q3[1], 2)])
+        self.assertIn("Duplicates inside one quiz or bank: 2 quizzes and banks, 3 extra copies and 1 question "
+                      "in more than one version", printed)
+        # the report: a section with a card per container, in the contents and the filter
+        section = report[report.index('<h2 id="inside">'):report.index('<h2 id="modified">')]
+        self.assertIn("1 question stored more than once (2 extra copies); 1 question stored in more than one "
+                      "version.", section)
+        self.assertIn("&times;3", section)
+        self.assertIn("The use of time to <del>communicate</del> <ins>send messages</ins>", section)
+        self.assertIn(f"href='#modified-{versions['modified_group']}'", section)
+        self.assertIn("href='#inside'", report)
+        self.assertIn('data-section="inside"', section)
+        # the plan's Repeats tab: one row per thing to fix
+        from openpyxl import load_workbook
+        rows = list(load_workbook(plan)["Repeats"].iter_rows(values_only=True))
+        self.assertEqual(sorted(r[2] for r in rows[1:]),
+                         ["2 versions: keep one wording", "Stored 2 times: delete 1", "Stored 3 times: delete 2"])
+
+    def test_nothing_found(self):
+        path = self.export({"non_cc_assessments/gc.xml.qti": bank("gc", "Clean bank", [item(*self.Q1)])})
+        out = os.path.join(self.dir, "report.html")
+        with mock.patch.object(sys, "argv", ["quiz_dedup.py", path, "-o", out]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qd.main()
+        with open(out, encoding="utf-8") as f:
+            self.assertIn("No quiz or bank holds a question twice or in two versions.", f.read())
 
 
 class Scoring(unittest.TestCase):

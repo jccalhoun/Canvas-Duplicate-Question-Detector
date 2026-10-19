@@ -133,6 +133,7 @@ The JSON file holds the same findings as the HTML report, in the same order, for
 | --- | --- |
 | `generated`, `settings`, `summary`, `question_images` | Run date, the options used, overall counts, and how question images were compared |
 | `bank_usage_audit`, `classic_bank_links` | Each bank's usage status, orphan verdict, how many of its questions are also stored elsewhere (`also_stored_elsewhere`), the kept banks it relies on or is kept for, and how many quiz questions point back to a bank question |
+| `duplicates_inside` | Each quiz or bank that stores a question more than once (with the number of copies) or in more than one version (with the modified-question group) |
 | `quiz_coverage` | For each quiz with questions of its own: the bank with the same questions (if any), the fewest banks covering it (`covered_by`), counts of questions in a linked bank, only in banks no quiz links to, only reworded in a bank, or in no bank, and the questions in the last three groups |
 | `quizzes_and_banks` | Every quiz and bank, with what each quiz draws or uses from banks |
 | `identical_quizzes_and_banks`, `mostly_contained`, `quizzes_with_nothing_in_export` | The whole-quiz and whole-bank findings |
@@ -257,9 +258,19 @@ The report answers "what is duplicated where". The action plan answers "what do 
 
   The **Keep** column names banks to keep until the quiz is done: some of its questions are in no bank that will stay (linked, kept as the one copy, or about to be drawn from by the plan).
 - **Banks**: the banks the bank check calls safe to delete, with why, and whether to go ahead. **yes** means delete it. **wait** means some of its questions are otherwise only in quizzes you have not finished, and in no bank that will stay; it names those quizzes. **no** means the plan has a quiz draw from it, so it will be in use.
+- **Repeats** (only when there are any): one row per question a quiz or bank stores more than once or in more than one version, as an optional cleanup list. See *Duplicates inside one quiz or bank*.
 - **Questions**: every question from a step 4 quiz that is in no bank, or only reworded in one, with its type, choices and answer, ready to add to a bank.
 
 Quizzes and banks that share a title carry the same `#` number as in the report. Nothing is changed in Canvas: the plan is a checklist for doing the work by hand. Text from the export is written as plain text, so a question starting with `=` is never run as a formula. When several exports are compared, only quizzes in the same export count for the Keep column, as in the bank check. After a round of changes, export the course again and rerun. Finished work drops off and the plan gets shorter.
+
+## Duplicates inside one quiz or bank
+
+This section lists every quiz and bank that stores a question more than once, or stores one question in more than one version. Copies spread across different quizzes and banks are covered elsewhere; this is only about what one quiz or bank holds on its own.
+
+- **Stored more than once.** Each repeated question is listed with how many copies there are (`×3`). An extra copy in a bank makes a question group more likely to draw it; an extra copy in a quiz asks it twice.
+- **Stored in more than one version.** Each pair is shown side by side, the other version's wording marked against the first, with a link to its group in *Modified questions*. Two versions in one bank mean a student can get the same question twice, worded differently.
+
+Only questions stored in the quiz or bank count, not ones a quiz draws from a bank. Cards are sorted by how much there is to fix and work with the title filter. The JSON has the same list as `duplicates_inside`, and the action plan has it as an optional **Repeats** tab, one row per thing to fix.
 
 ## Duplicate quizzes and banks
 
