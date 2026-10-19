@@ -299,6 +299,8 @@ A New Quiz can also use single questions chosen from an item bank, including a b
 
 ## How matching works
 
+Question text is read the way a browser shows it. Numbered lists made with list markup (`<ol type="I">`) get their numbers written out (`I.`, `II.`, nested `a.`, `b.`), so a question that numbers its parts with a list reads the same as one where `I.` and `II.` are typed in.
+
 Question text is compared after lowercasing and removing HTML, punctuation, and extra whitespace. The order of answer choices is ignored.
 
 Two questions are treated as versions of the same question when one of these is true:
