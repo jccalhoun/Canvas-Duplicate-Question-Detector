@@ -195,10 +195,69 @@ def image_token(match):
     return f" [image: {name}] "
 
 
+LIST_TAG_RE = re.compile(r"<(/?)(ol|ul|li)\b([^<>]*)>", re.I)
+LIST_ATTR_RE = re.compile(r"""\b(type|start|value)\s*=\s*["']?([^"'\s>]+)""", re.I)
+
+
+def roman(n):
+    out = ""
+    for value, letters in ((1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
+                           (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")):
+        while n >= value:
+            out, n = out + letters, n - value
+    return out
+
+
+def list_label(n, kind):
+    """The number a browser shows for item n of an <ol type=kind>."""
+    if kind in ("I", "i"):
+        label = roman(n)
+        return label if kind == "I" else label.lower()
+    if kind in ("A", "a") and n > 0:
+        label = ""
+        while n:
+            n, r = divmod(n - 1, 26)
+            label = chr(ord("A") + r) + label
+        return label if kind == "A" else label.lower()
+    return str(n)
+
+
+def number_lists(text):
+    """Write out the numbers a browser shows for ordered lists ("I.", "2.",
+    "b."), so a question that numbers its parts with <ol type="I"> reads the
+    same as one with "I." typed in. Nested lists keep their own count;
+    start= on the list and value= on an item are honoured."""
+    if "<ol" not in text.lower():
+        return text
+    stack, out, last = [], [], 0
+    for m in LIST_TAG_RE.finditer(text):
+        out.append(text[last:m.end()])
+        last = m.end()
+        closing, tag, attrs = m.group(1), m.group(2).lower(), dict(
+            (k.lower(), v) for k, v in LIST_ATTR_RE.findall(m.group(3)))
+        if tag in ("ol", "ul"):
+            if closing:
+                if stack:
+                    stack.pop()
+            elif tag == "ol":
+                start = int(attrs["start"]) if attrs.get("start", "").lstrip("-").isdigit() else 1
+                stack.append([attrs.get("type", "1"), start - 1])
+            else:
+                stack.append(None)
+        elif tag == "li" and not closing and stack and stack[-1] is not None:
+            if attrs.get("value", "").lstrip("-").isdigit():
+                stack[-1][1] = int(attrs["value"]) - 1
+            stack[-1][1] += 1
+            out.append(f" {list_label(stack[-1][1], stack[-1][0])}. ")
+    out.append(text[last:])
+    return "".join(out)
+
+
 def strip_html(text):
     """Turn an HTML fragment (already unescaped) into plain readable text."""
     if not text:
         return ""
+    text = number_lists(text)
     text = IMG_RE.sub(image_token, text)
     text = TAG_RE.sub(" ", text)
     text = html.unescape(text)

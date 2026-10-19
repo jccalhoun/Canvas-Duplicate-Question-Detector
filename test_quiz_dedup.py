@@ -1029,6 +1029,24 @@ class ReviewFixes4(ExportCase):
         questions = qd.collect_questions([self.export({"non_cc_assessments/gb.xml.qti": xml})])[0]
         self.assertEqual([q.text for q in questions], [STEM])
 
+    def test_list_numbers_in_markup_match_typed_numbers(self):
+        listed = ('<p>Main points:</p><ol type="I"><li><p>The grid is in danger.</p></li>'
+                  '<li><p>Only cooperation can solve it.</p></li></ol><p>These are in which order?</p>')
+        typed = ('<p>Main points:</p>I. The grid is in danger.<br><br>II. Only cooperation can solve it.'
+                 '<p>These are in which order?</p>')
+        questions = qd.collect_questions([self.export({"non_cc_assessments/gb.xml.qti": bank("gb", "Pool", [
+            item(MC, listed, CHOICES, [CHOICES[0]]), item(MC, typed, CHOICES, [CHOICES[0]])])})])[0]
+        self.assertEqual(questions[0].text, "Main points: I. The grid is in danger. II. Only cooperation can solve it. "
+                                            "These are in which order?")
+        self.assertEqual(len(qd.build_variants(questions)), 1)  # the same question
+
+    def test_list_numbering_follows_type_start_value_and_nesting(self):
+        self.assertEqual(qd.strip_html('<ol><li>a</li><li>b<ol type="a"><li>x</li><li>y</li></ol></li><li>c</li></ol>'),
+                         "1. a 2. b a. x b. y 3. c")
+        self.assertEqual(qd.strip_html('<ol type="A" start="3"><li>c</li><li value="10">j</li></ol><ul><li>dot</li></ul>'),
+                         "C. c J. j dot")
+        self.assertEqual(qd.strip_html('<ol type="i" start="4"><li>four</li></ol>'), "iv. four")
+
     def test_uppercase_extensions_are_found(self):
         os.makedirs(os.path.join(self.dir, "x"))
         with open(os.path.join(self.dir, "x", "BANK.QTI"), "w", encoding="utf-8") as f:
